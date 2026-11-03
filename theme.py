@@ -113,5 +113,9 @@ QMenu { background: #171b24; border: 1px solid #30374a; padding: 6px; border-rad
 QMenu::item { padding: 8px 24px 8px 14px; border-radius: 7px; }
 QMenu::item:selected { background: #2b3246; }
 QMenu::separator { height: 1px; background: #2a3042; margin: 5px 8px; }
+QCheckBox { spacing: 8px; background: transparent; }
+QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid #4a5268; background: #1a1f2b; }
+QCheckBox::indicator:hover { border-color: #818cf8; }
+QCheckBox::indicator:checked { background: #6366f1; border-color: #a5b4fc; }
 QToolTip { background: #222836; color: #e8eaed; border: 1px solid #3a4260; padding: 5px 7px; }
 """
