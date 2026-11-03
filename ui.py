@@ -51,6 +51,24 @@ class ThumbJob(QRunnable):
             pass
 
 
+class Strip(QListWidget):
+    """Thumbnails. Dragging one out gives that picture (with its edits) to other programs."""
+
+    def __init__(self):
+        super().__init__()
+        self.provider = None
+
+    def mimeData(self, items):
+        if self.provider is not None and items:
+            try:
+                md = self.provider(items[0].data(Qt.ItemDataRole.UserRole))
+            except Exception:
+                md = None
+            if md is not None:
+                return md
+        return super().mimeData(items)
+
+
 # ---------------------------------------------------------------- carousel
 class Carousel(QWidget):
     """Cards side by side, each as big as the window; slides smoothly between them."""
@@ -176,7 +194,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Image Fixer")
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
-        self.setMinimumSize(1180, 640)
+        self.setMinimumSize(1240, 700)
 
         central = QWidget()
         central.setObjectName("root")
@@ -307,7 +325,11 @@ class MainWindow(QMainWindow):
         self.btnNext.setObjectName("nav")
         self.btnPrev.clicked.connect(lambda: self.carousel.prev())
         self.btnNext.clicked.connect(lambda: self.carousel.next())
-        self.strip = QListWidget()
+        self.strip = Strip()
+        self.strip.provider = self._mime_for
+        self.strip.setDragEnabled(True)
+        self.strip.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.strip.setObjectName("strip")
         self.strip.setViewMode(QListView.ViewMode.IconMode)
         self.strip.setFlow(QListView.Flow.LeftToRight)
@@ -371,6 +393,7 @@ class MainWindow(QMainWindow):
         sc("Left", lambda: self.carousel.prev())
         sc("Right", lambda: self.carousel.next())
         sc("Ctrl+V", self.paste)
+        sc("Ctrl+C", lambda: self._with_current(lambda c: c.copy_image()))
         sc("Ctrl+O", self.choose_files)
         sc("Ctrl+S", lambda: self._with_current(self.save_card))
         sc("Ctrl+Shift+S", self.save_all)
@@ -503,11 +526,14 @@ class MainWindow(QMainWindow):
         c.removeRequested.connect(self.remove_card)
         c.saveRequested.connect(self.save_card)
         c.saveAsRequested.connect(self.save_card_as)
+        c.saveAllRequested.connect(self.save_all)
+        c.applyAllRequested.connect(self.apply_to_all)
         c.message.connect(self.say)
         self.carousel.add_card(c)
         it = QListWidgetItem(self._label(c))
         it.setSizeHint(QSize(96, 90))
-        it.setToolTip(path)
+        it.setToolTip(path + "\n(drag it out to take the picture to another program)")
+        it.setData(Qt.ItemDataRole.UserRole, c.uid)
         it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
         self._sync = True
         self.strip.addItem(it)
@@ -549,8 +575,12 @@ class MainWindow(QMainWindow):
         self.btnPrev.setEnabled(n > 1 and i > 0)
         self.btnNext.setEnabled(n > 1 and i < n - 1)
         unsaved = sum(1 for c in self.carousel.cards if c.is_unsaved()) if n else 0
-        self.btnSaveAll.setText("Save all edited (%d)" % unsaved if unsaved else "Save all edited")
+        label = "Save all edited (%d)" % unsaved if unsaved else "Save all edited"
+        self.btnSaveAll.setText(label)
         self.btnSaveAll.setEnabled(unsaved > 0)
+        for c in (self.carousel.cards if n else []):
+            c.btnSaveAll.setText(label)
+            c.btnSaveAll.setEnabled(unsaved > 0)
         self.btnClear.setEnabled(n > 0)
         if n == 0:
             self.stack.setCurrentIndex(0)
@@ -564,6 +594,29 @@ class MainWindow(QMainWindow):
     def say(self, text):
         self.lblStatus.setText(text)
         QTimer.singleShot(9000, lambda t=text: self.lblStatus.setText("") if self.lblStatus.text() == t else None)
+
+    # ------------------------------------------------- apply to all / drag out
+    def apply_to_all(self, card):
+        others = [c for c in self.carousel.cards if c is not card]
+        if not others:
+            self.say("There is no other picture yet.")
+            return
+        st = card.settings()
+        for c in others:
+            c.apply_settings(st)
+        self._refresh_counts()
+        self.say("Same colors / saturation / clarity given to %d other picture(s). "
+                 "From now on a change stays on the picture you change." % len(others))
+
+    def _mime_for(self, uid):
+        for c in self.carousel.cards:
+            if c.uid == uid:
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    return c.make_mime()[0]
+                finally:
+                    QApplication.restoreOverrideCursor()
+        return None
 
     # ----------------------------------------------------------- removing
     def remove_card(self, c):
