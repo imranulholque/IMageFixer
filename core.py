@@ -270,7 +270,7 @@ def get_fill(rgb, masks, keys, cache=None):
         return cache[key]
     H, W = rgb.shape[:2]
     hole = np.maximum.reduce(masks) > 0.03
-    hole_img = Image.fromarray((hole * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(3))
+    hole_img = Image.fromarray((hole * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(9))
     valid = 1.0 - np.asarray(hole_img, dtype=np.float32) / 255.0
     if H * W > 6_000_000:                   # huge picture: the fill is smooth, so work on a smaller copy
         f = (H * W / 3_000_000.0) ** 0.5
@@ -338,34 +338,56 @@ def clarity(rgb, sharp, detail):
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
 
-def focus_overlay(rgb8, mask):
-    """Shows which part of the picture a colour / shade selects (for the screen only, never saved)."""
-    m = np.clip(mask, 0, 1)[..., None]
-    x = rgb8.astype(np.float32)
-    x = x * (1.0 - 0.18 * (1 - m))
-    tint = np.array([255.0, 40.0, 200.0], dtype=np.float32)
-    x = x * (1 - 0.62 * m) + tint * (0.62 * m)
-    return np.clip(x + 0.5, 0, 255).astype(np.uint8)
+def _grow(m):
+    """Selection grown by ~2 px so anti-aliased edge pixels of a stamp are included."""
+    im = Image.fromarray((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))
+    return np.asarray(im.filter(ImageFilter.GaussianBlur(0.8)), dtype=np.float32) / 255.0
+
+
+def unmix_ink(x, P, ink, w, r, tol):
+    """Takes ink out of the pixels: pixel = paper*(1-a) + ink*a, so we find a and give back that part of the paper.
+    Edges fade out smoothly, paper texture stays, nothing gets a new colour.  r = 0..1 how much to remove."""
+    u = ink[None, None, :] - P
+    v = x - P
+    uu = (u * u).sum(2) + 1e-3
+    al = (v * u).sum(2) / uu
+    perp = np.sqrt(np.maximum(((v - al[..., None] * u) ** 2).sum(2), 0.0))
+    t = max(14.0, tol * 1.1)
+    gate = 1.0 - _smooth((perp - t) / t)
+    gate *= _smooth(np.sqrt(uu) / 45.0)
+    al = np.clip((al - 0.04) / 0.96, 0.0, 1.5)
+    return x - u * (al * gate * w * r)[..., None]
 
 
 def active_adjs(adjs):
     return [a for a in adjs if a["k"] != 100]
 
 
-def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, focus=None, chunk_rows=0):
+def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_rows=0):
     """The whole edit chain on a uint8 picture.  lab / cache let the live preview reuse earlier work."""
     act = active_adjs(adjs)
     dec = [a for a in act if a["k"] < 100]
     if cache is not None:
         keep = {("m",) + adj_key(a) for a in adjs}
         keep.add(("f",) + tuple(adj_key(a) for a in dec))
+        keep |= {("g",) + adj_key(a) for a in dec}
         for k in [k for k in cache if k not in keep]:
             del cache[k]
-    if not act and sat == 100 and sharp <= 0 and detail <= 0 and focus is None:
+    if not act and sat == 100 and sharp <= 0 and detail <= 0:
         return rgb
     H, W = rgb.shape[:2]
     masks = {a["id"]: get_mask(rgb, a, lab, cache) for a in act}
     F = get_fill(rgb, [masks[a["id"]] for a in dec], [adj_key(a) for a in dec], cache) if dec else None
+    grown = {}
+    for a in dec:
+        if a["type"] == "color":
+            gk = ("g",) + adj_key(a)
+            g = cache.get(gk) if cache is not None else None
+            if g is None:
+                g = np.maximum(masks[a["id"]], _grow(masks[a["id"]]))
+                if cache is not None:
+                    cache[gk] = g
+            grown[a["id"]] = g
     out8 = np.empty_like(rgb)
     rows = chunk_rows or H
     for y0 in range(0, H, rows):
@@ -373,7 +395,10 @@ def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, focus=No
         x = rgb[y0:y1].astype(np.float32)
         for a in act:
             m = masks[a["id"]][y0:y1]
-            if a["k"] < 100:
+            if a["k"] < 100 and a["type"] == "color":
+                x = unmix_ink(x, F[y0:y1].astype(np.float32), np.array(a["rgb"], np.float32),
+                              grown[a["id"]][y0:y1], (100 - a["k"]) / 100.0, a["tol"])
+            elif a["k"] < 100:
                 x += (F[y0:y1].astype(np.float32) - x) * (m * ((100 - a["k"]) / 100.0))[..., None]
             else:
                 t = min((a["k"] - 100) / 100.0, 1.0)
@@ -388,8 +413,6 @@ def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, focus=No
         out8[y0:y1] = np.clip(x + 0.5, 0, 255).astype(np.uint8)
     if sharp > 0 or detail > 0:
         out8 = clarity(out8, sharp, detail)
-    if focus is not None:
-        out8 = focus_overlay(out8, get_mask(rgb, focus, lab, cache))
     return out8
 
 

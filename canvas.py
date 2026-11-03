@@ -2,7 +2,7 @@
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
@@ -52,6 +52,14 @@ class ImageCanvas(QWidget):
         self.clone_src = None                 # QPointF, spot to copy from
         self.clone_delta = None               # QPointF, offset source - destination
         self._msg = "Loading..."
+        self._sel = None                      # float mask (preview size) or None
+        self.sel_visible = True
+        self._ants_key = None
+        self._ants = None
+        self._phase = 0
+        self._ants_timer = QTimer(self)
+        self._ants_timer.setInterval(120)
+        self._ants_timer.timeout.connect(self._tick)
         self._pick_cursor = dropper_cursor()
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
@@ -81,6 +89,63 @@ class ImageCanvas(QWidget):
         if src is not None:
             self._src = src
         self.update()
+
+    # ------------------------------------------------------ marching ants
+    def set_selection(self, mask):
+        self._sel = mask
+        self._ants_key = None
+        self._sync_ants()
+        self.update()
+
+    def set_selection_visible(self, on):
+        self.sel_visible = bool(on)
+        self._sync_ants()
+        self.update()
+
+    def _sync_ants(self):
+        if self._sel is not None and self.sel_visible:
+            if not self._ants_timer.isActive():
+                self._ants_timer.start()
+        else:
+            self._ants_timer.stop()
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 8
+        self.update()
+
+    def _ants_edges(self):
+        key = (round(self.zoom, 4), round(self.off.x()), round(self.off.y()), self.width(), self.height())
+        if self._ants_key != key:
+            w, h = self.width(), self.height()
+            H, W = self._sel.shape
+            ix = ((np.arange(w) - self.off.x()) / self.zoom).astype(np.int64)
+            iy = ((np.arange(h) - self.off.y()) / self.zoom).astype(np.int64)
+            okx, oky = (ix >= 0) & (ix < W), (iy >= 0) & (iy < H)
+            m = np.zeros((h, w), dtype=bool)
+            if okx.any() and oky.any():
+                sub = self._sel[np.clip(iy, 0, H - 1)][:, np.clip(ix, 0, W - 1)] > 0.5
+                m = sub & oky[:, None] & okx[None, :]
+            e = m.copy()
+            e[1:-1, 1:-1] &= m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:]
+            e[0, :] &= False
+            e[-1, :] &= False
+            e[:, 0] &= False
+            e[:, -1] &= False
+            edge = m & ~e
+            ys, xs = np.nonzero(edge)
+            self._ants = (ys, xs)
+            self._ants_key = key
+        return self._ants
+
+    def _paint_ants(self, p):
+        ys, xs = self._ants_edges()
+        if ys.size == 0:
+            return
+        buf = np.zeros((self.height(), self.width(), 4), dtype=np.uint8)
+        on = ((xs + ys + self._phase * 1) // 4) % 2 == 0
+        buf[ys, xs] = np.where(on[:, None], np.array([0, 0, 0, 255], np.uint8), np.array([255, 255, 255, 255], np.uint8))
+        img = QImage(buf.data, buf.shape[1], buf.shape[0], buf.shape[1] * 4, QImage.Format.Format_RGBA8888)
+        p.drawImage(0, 0, img.copy())
 
     def has_image(self):
         return self._img is not None
@@ -193,6 +258,8 @@ class ImageCanvas(QWidget):
         p.scale(self.zoom, self.zoom)
         p.drawImage(0, 0, self._img)
         p.restore()
+        if self._sel is not None and self.sel_visible and self.mode in (self.VIEW, self.PICK):
+            self._paint_ants(p)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self.mode == self.CROP:
             self._paint_crop(p)

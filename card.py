@@ -291,14 +291,8 @@ class ColorPanel(QWidget):
         self.rowFeather = SliderRow("Feather (soft edges)", 0, 100, 0, ("sharp edge", "", "very soft"),
                                     "Softens the edge of the selected colors, so the change blends into the rest "
                                     "of the picture (like Feather in Photoshop). Applies to all colors above.")
-        self.chkSel = QCheckBox("Show the selected part on the picture")
-        self.chkSel.setChecked(True)
-        self.chkSel.setToolTip("While you point at a color or move its slider, the part of the picture it selects "
-                               "is shown in pink.")
         fl.addWidget(self.rowFeather)
-        fl.addWidget(self.chkSel)
         self.rowFeather.changed.connect(self.featherChanged.emit)
-        self.chkSel.toggled.connect(self.selToggled.emit)
 
         self.lay.addWidget(self.adjust)
         self.lay.addWidget(self.hint)
@@ -322,7 +316,7 @@ class ColorPanel(QWidget):
         self.lay.insertWidget(self.lay.count() - 2, w)
 
     def sel_enabled(self):
-        return self.chkSel.isChecked()
+        return True
 
     def set_globals(self, sat, sharp, detail, feather):
         self.rowSat.set_value(sat)
@@ -571,6 +565,11 @@ class Card(QWidget):
         self.btnShadow.setToolTip("Evens out the paper lighting and removes soft shadows in one click")
         r2.addSpacing(10)
         r2.addWidget(self.btnShadow)
+        self.btnSelVis = QPushButton("Selection")
+        self.btnSelVis.setCheckable(True)
+        self.btnSelVis.setChecked(True)
+        self.btnSelVis.setToolTip("Show / hide the dashed outline of the selected color")
+        r2.addWidget(self.btnSelVis)
         self.btnApply = QPushButton("Apply")
         self.btnApply.setProperty("accent", True)
         self.btnCancel = QPushButton("Cancel")
@@ -692,8 +691,7 @@ class Card(QWidget):
         self.panel.removeBands.connect(self._remove_bands)
         self.panel.clearAll.connect(self._clear_adjs)
         self.panel.activated.connect(self._set_focus)
-        self.panel.deactivated.connect(self._clear_focus)
-        self.panel.selToggled.connect(lambda on: self._timer.start())
+        self.btnSelVis.toggled.connect(self.canvas.set_selection_visible)
         self.panel.satChanged.connect(lambda v: self._set_global("sat", v))
         self.panel.sharpChanged.connect(lambda v: self._set_global("sharp", v))
         self.panel.detailChanged.connect(lambda v: self._set_global("detail", v))
@@ -770,8 +768,9 @@ class Card(QWidget):
     def _compute(self):
         focus = self._focus_adj()
         lab = self._get_lab() if (core.active_adjs(self.adjs) or focus is not None) else None
-        return core.render(self.prev, self.adjs, self.sat, self.sharp, self.detail,
-                           lab=lab, cache=self._cache, focus=focus)
+        out = core.render(self.prev, self.adjs, self.sat, self.sharp, self.detail, lab=lab, cache=self._cache)
+        self.canvas.set_selection(None if focus is None else core.get_mask(self.prev, focus, lab, self._cache))
+        return out
 
     def _render_now(self):
         if not self._loaded:
@@ -919,10 +918,6 @@ class Card(QWidget):
         """Shows for a moment which part of the picture was selected."""
         self._set_focus(aid)
 
-        def later():
-            if self.panel.hover_id is None and self._focus_id == aid:
-                self._clear_focus()
-        QTimer.singleShot(1800, later)
 
     def _remove_adj(self, aid):
         self.adjs = [a for a in self.adjs if a["id"] != aid]
