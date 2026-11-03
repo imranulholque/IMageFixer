@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QThreadPool
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 failed = []
 
@@ -45,6 +45,10 @@ def make_pages(folder):
 
 def main():
     app = QApplication(sys.argv)
+    # a real dialog would wait for a click forever: answer them automatically
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+    QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
     import ui
     from canvas import ImageCanvas
     from theme import QSS
@@ -146,6 +150,90 @@ def main():
         card.undo_step()
     step("auto shadow + undo", shadow)
 
+    def globals_():
+        card.panel.rowSat.sl.setValue(140)
+        card.panel.rowSharp.sl.setValue(50)
+        card.panel.rowDetail.sl.setValue(30)
+        card.panel.rowFeather.sl.setValue(20)
+        card._render_now()
+        assert (card.sat, card.sharp, card.detail, card.feather) == (140, 50, 30, 20)
+        assert all(a["feather"] == 20 for a in card.adjs)
+        assert not card.canvas.grab().isNull()
+    step("saturation, clarity, feather sliders", globals_)
+
+    def selection():
+        aid = card.adjs[0]["id"]
+        card._set_focus(aid)
+        card._render_now()
+        assert card._focus_adj() is not None and not card.canvas.grab().isNull()
+        card.panel.chkSel.setChecked(False)
+        assert card._focus_adj() is None
+        card.panel.chkSel.setChecked(True)
+        card._clear_focus()
+    step("selected part is shown", selection)
+
+    def zero_fill():
+        for a in card.adjs:
+            a["k"] = 100
+        card.panel.rebuild(card.adjs)
+        red = [a for a in card.adjs if a["type"] == "color"][0]
+        red["k"] = 0
+        card.sat, card.sharp, card.detail = 100, 0, 0
+        out = card._compute()
+        assert out.shape == card.prev.shape
+        card.panel.rebuild(card.adjs)
+    step("color at 0 is filled from surroundings", zero_fill)
+
+    def eraser():
+        card.tools[ImageCanvas.ERASE].click()
+        assert not card.eraseBar.isHidden()
+        n = card.ops
+        card.canvas.eraseFinished.emit("brush", [(100.0, 80.0), (300.0, 80.0)])
+        card.canvas.eraseFinished.emit("rect", (100.0, 150.0, 300.0, 200.0))
+        card.canvas.eraseFinished.emit("ellipse", (320.0, 150.0, 420.0, 220.0))
+        card.canvas.eraseFinished.emit("lasso", [(50.0, 300.0), (200.0, 290.0), (210.0, 380.0), (60.0, 390.0)])
+        assert card.ops == n + 4, (card.ops, n)
+        card.canvas.sourcePicked.emit(50.0, 50.0)
+        assert card.clone_src is not None
+        card.canvas.eraseFinished.emit("brush", [(200.0, 450.0), (260.0, 450.0)])
+        assert card.clone_off is not None and card.ops == n + 5
+        card._clear_clone()
+        # a real stroke with the mouse
+        c = card.canvas
+        card.shapeBtns[0].click()
+        QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(300, 300))
+        QTest.mouseMove(c, QPoint(340, 320))
+        QTest.mouseMove(c, QPoint(380, 340))
+        assert not c.grab().isNull()
+        QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(380, 340))
+        assert card.ops == n + 6, (card.ops, n)
+        card.shapeBtns[1].click()
+        QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(200, 200))
+        QTest.mouseMove(c, QPoint(260, 250))
+        QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(260, 250))
+        assert card.ops == n + 7, (card.ops, n)
+        for _ in range(7):
+            card.undo_step()
+        assert card.ops == n
+        card._go_move()
+    step("eraser: brush, shapes, clone, mouse", eraser)
+
+    def copy_out():
+        card.copy_image()
+        md = QApplication.clipboard().mimeData()
+        assert md is not None and md.hasUrls()
+        path = md.urls()[0].toLocalFile()
+        assert os.path.exists(path) and "_edited" in os.path.basename(path), path
+        m2, p2 = card.make_mime()
+        assert m2.hasUrls() and m2.hasImage()
+    step("copy the edited picture", copy_out)
+
+    def strip_drag():
+        md = win._mime_for(card.uid)
+        assert md is not None and md.hasUrls()
+        assert win.strip.provider is not None
+    step("drag out data", strip_drag)
+
     def save_one():
         win.save_card(card)
         files = os.listdir(out)
@@ -161,6 +249,23 @@ def main():
         files = os.listdir(out)
         assert any(f.startswith("page1_edited") for f in files), files
     step("save all edited", save_all)
+
+    def apply_all():
+        win.carousel.go_to(0, animate=False)
+        c0 = win.carousel.current()
+        c0.panel.rowSat.sl.setValue(130)
+        win.apply_to_all(c0)
+        for c in win.carousel.cards:
+            if c is not c0:
+                assert c.is_edited()
+                c.ensure_loaded()
+                assert c.sat == 130, c.sat
+        other = win.carousel.cards[1]
+        other.panel.rowSat.sl.setValue(170)          # a later change stays on this picture only
+        assert other.sat == 170 and c0.sat == 130
+        assert all(c.btnSaveAll.isEnabled() for c in win.carousel.cards)
+        win.save_all()
+    step("apply to all, then change one picture", apply_all)
 
     def nav():
         win.carousel.go_to(0, animate=False)
