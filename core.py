@@ -5,7 +5,7 @@ import os
 import uuid
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -119,28 +119,32 @@ def _smooth(x):
 
 # -------------------------------------------------------------- adjustments
 # An adjustment is a plain dict, so it can be copied for undo:
-#   colour : {"type":"color","target":[L,a,b],"tol":30,"k":100,...}
-#   band   : {"type":"band","lo":..,"hi":..,"center":L,"k":100,...}   (black / gray shades)
-# k = 100 -> unchanged,  k < 100 -> fades towards white (0 = white),  k > 100 -> darker (200 = black)
-def new_color_adj(rgb, lab_pt, tol=30.0):
+#   colour : {"type":"color","target":[L,a,b],"tol":30,"k":100,"feather":0,...}
+#   band   : {"type":"band","lo":..,"hi":..,"center":L,"k":100,"feather":0,...}   (black / gray shades)
+# k = 100 -> unchanged
+# k < 100 -> that colour is removed and replaced by what surrounds it (0 = fully gone)
+# k > 100 -> colours get stronger and clearer;  black / gray shades get darker
+def new_color_adj(rgb, lab_pt, tol=30.0, feather=0):
     rgb = [int(v) for v in rgb]
     return {"id": uuid.uuid4().hex[:8], "type": "color",
             "target": [float(lab_pt[0]), float(lab_pt[1]), float(lab_pt[2])],
-            "rgb": rgb, "tol": float(tol), "k": 100,
+            "rgb": rgb, "tol": float(tol), "k": 100, "feather": int(feather),
             "label": "%s  %s" % (color_name(rgb), hex_of(rgb))}
 
 
-def new_band_adj(center, lo, hi):
+def new_band_adj(center, lo, hi, feather=0):
     g = L_to_gray(center)
     return {"id": uuid.uuid4().hex[:8], "type": "band", "lo": lo, "hi": hi,
-            "center": float(center), "rgb": [g, g, g], "k": 100, "label": band_name(center)}
+            "center": float(center), "rgb": [g, g, g], "k": 100, "feather": int(feather),
+            "label": band_name(center)}
 
 
 def adj_key(a):
+    f = int(a.get("feather", 0))
     if a["type"] == "color":
         t = a["target"]
-        return ("c", round(t[0], 1), round(t[1], 1), round(t[2], 1), round(a["tol"], 1))
-    return ("b", None if a["lo"] is None else round(a["lo"], 1), None if a["hi"] is None else round(a["hi"], 1))
+        return ("c", round(t[0], 1), round(t[1], 1), round(t[2], 1), round(a["tol"], 1), f)
+    return ("b", None if a["lo"] is None else round(a["lo"], 1), None if a["hi"] is None else round(a["hi"], 1), f)
 
 
 def _neutral_factor(lab):
@@ -149,7 +153,7 @@ def _neutral_factor(lab):
 
 
 def adj_mask(lab, a):
-    """float32 0..1 : how strongly each pixel belongs to this colour / shade."""
+    """float32 0..1 : how strongly each pixel belongs to this colour / shade (no feather)."""
     if a["type"] == "color":
         t = a["target"]
         dL = (lab[..., 0] - t[0]) * 0.8
@@ -167,54 +171,234 @@ def adj_mask(lab, a):
     return m.astype(np.float32)
 
 
-def apply_k(rgbf, mask, k):
-    t = (k - 100) / 100.0
-    if t == 0:
-        return rgbf
-    m = mask[..., None]
-    if t < 0:
-        rgbf += (255.0 - rgbf) * ((-t) * m)
+def feather_mask(m, amount, long_side):
+    """Soft edge like Photoshop's Feather. amount 0..100, relative to the picture size."""
+    if amount <= 0:
+        return m
+    sigma = amount / 100.0 * 0.02 * long_side
+    if sigma < 0.4:
+        return m
+    im = Image.fromarray((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8)).filter(ImageFilter.GaussianBlur(sigma))
+    return np.asarray(im, dtype=np.float32) / 255.0
+
+
+def get_mask(rgb, a, lab=None, cache=None):
+    """Selection of one colour / shade, with feather. Cached for the live preview."""
+    key = ("m",) + adj_key(a)
+    if cache is not None and key in cache:
+        return cache[key]
+    H, W = rgb.shape[:2]
+    if lab is not None:
+        m = adj_mask(lab, a)
+    else:                                   # big picture: no full Lab copy, work in strips
+        m = np.empty((H, W), dtype=np.float32)
+        for y in range(0, H, 500):
+            m[y:y + 500] = adj_mask(rgb_to_lab(rgb[y:y + 500]), a)
+    m = feather_mask(m, a.get("feather", 0), max(H, W))
+    if cache is not None:
+        cache[key] = m
+    return m
+
+
+# ------------------------------------------------------ fill from surroundings
+def _pool2(a):
+    return a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2]
+
+
+def _up(a, h, w):
+    """bilinear resize of a float32 (h0,w0) or (h0,w0,C) array."""
+    if a.ndim == 3:
+        return np.stack([_up(a[..., c], h, w) for c in range(a.shape[2])], -1)
+    im = Image.fromarray(np.ascontiguousarray(a, dtype=np.float32))
+    return np.asarray(im.resize((w, h), Image.Resampling.BILINEAR), dtype=np.float32)
+
+
+def _fill_pyramid(S0, W0, want):
+    """Multi-scale 'average of the trusted pixels around'. Returns {level: estimate (padded size)}."""
+    H, W = W0.shape
+    L, hh, ww = 0, H, W
+    while min(hh, ww) >= 8 and L < 9:
+        hh, ww, L = (hh + 1) // 2, (ww + 1) // 2, L + 1
+    mult = 1 << L
+    ph, pw = -(-H // mult) * mult, -(-W // mult) * mult
+    S = np.pad(S0, ((0, ph - H), (0, pw - W), (0, 0)))
+    Wt = np.pad(W0, ((0, ph - H), (0, pw - W)))
+    levels = [(S, Wt)]
+    for _ in range(L):
+        S, Wt = _pool2(S), _pool2(Wt)
+        levels.append((S, Wt))
+    total = float(levels[-1][1].sum())
+    gmean = (levels[-1][0].sum((0, 1)) / total).astype(np.float32) if total > 1e-6 else np.full(3, 255.0, np.float32)
+    out, F = {}, None
+    low = min(want)
+    for l in range(L, low - 1, -1):
+        S_l, W_l = levels[l]
+        has = (W_l > 1e-6)[..., None]
+        avg = S_l / np.maximum(W_l, 1e-6)[..., None]
+        if F is None:
+            F = np.where(has, avg, gmean).astype(np.float32)
+        else:
+            up = _up(F, S_l.shape[0], S_l.shape[1])
+            frac = np.clip(W_l / (4.0 ** l), 0, 1)[..., None]
+            F = np.where(has, frac * avg + (1 - frac) * up, up).astype(np.float32)
+        out[l] = F
+    return out, L
+
+
+def fill_background(rgb, valid):
+    """What should be where pixels were removed?  rgb uint8 (H,W,3); valid (H,W) 1 = trusted background pixel.
+    Returns uint8 (H,W,3): a smooth picture of the surroundings (colour of paper, table, wall ...)."""
+    H, W = valid.shape
+    v = np.clip(valid, 0, 1).astype(np.float32)
+    rgbf = rgb.astype(np.float32)
+    base = 1 if max(H, W) > 700 else 0
+    out, L = _fill_pyramid(rgbf * v[..., None], v, {base})
+    nb_level = max(base, min(3, L))
+    nb = _up(out[nb_level][: -(-H // (1 << nb_level)), : -(-W // (1 << nb_level))], H, W)
+    # second pass: trust only pixels that look like the background around them (ignores nearby text / lines)
+    d = np.abs(rgbf - nb).sum(2)
+    w2 = (v * np.exp(-(d / 45.0) ** 2)).astype(np.float32)
+    out2, _ = _fill_pyramid(rgbf * w2[..., None], w2, {base})
+    F = out2[base]
+    F = _up(F[: -(-H // (1 << base)), : -(-W // (1 << base))], H, W) if base else F[:H, :W]
+    return np.clip(F + 0.5, 0, 255).astype(np.uint8)
+
+
+def get_fill(rgb, masks, keys, cache=None):
+    key = ("f",) + tuple(keys)
+    if cache is not None and key in cache:
+        return cache[key]
+    H, W = rgb.shape[:2]
+    hole = np.maximum.reduce(masks) > 0.03
+    hole_img = Image.fromarray((hole * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(3))
+    valid = 1.0 - np.asarray(hole_img, dtype=np.float32) / 255.0
+    if H * W > 6_000_000:                   # huge picture: the fill is smooth, so work on a smaller copy
+        f = (H * W / 3_000_000.0) ** 0.5
+        sw, sh = max(8, int(W / f)), max(8, int(H / f))
+        small = np.asarray(Image.fromarray(rgb).resize((sw, sh), Image.Resampling.BOX))
+        sv = np.asarray(Image.fromarray((valid * 255).astype(np.uint8)).resize((sw, sh), Image.Resampling.BOX),
+                        dtype=np.float32) / 255.0
+        sv = (sv > 0.999).astype(np.float32)
+        F = fill_background(small, sv)
+        F = np.asarray(Image.fromarray(F).resize((W, H), Image.Resampling.BILINEAR))
     else:
-        rgbf *= (1.0 - min(t, 1.0) * m)
-    return rgbf
+        F = fill_background(rgb, valid)
+    if cache is not None:
+        cache[key] = F
+    return F
+
+
+# ------------------------------------------------------- saturation / clarity
+def _saturate(x, sat):
+    """Saturation of the whole picture. White and gray never change when it goes up;
+    when it goes down, colours get lighter and lighter until they are white."""
+    if sat == 100:
+        return x
+    if sat > 100:
+        g = (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114)[..., None]
+        return g + (x - g) * (sat / 100.0)
+    mx, mn = x.max(2), x.min(2)
+    S = (mx - mn) / np.maximum(mx, 1.0)
+    w = _smooth(S / 0.35)                          # grays (black text, paper) stay as they are
+    f = (100 - sat) / 100.0
+    return x + (255.0 - x) * (f * w)[..., None]
+
+
+def clarity(rgb, sharp, detail):
+    """Sharper lines / text (sharp) and stronger texture / faint strokes (detail), both 0..100.
+    Only the lightness is changed, with a limit against halos, so shapes are never bent or moved."""
+    if sharp <= 0 and detail <= 0:
+        return rgb
+    H, W = rgb.shape[:2]
+    long = max(H, W)
+    x = rgb.astype(np.float32)
+    Y = x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114
+    Yf = Y.copy()
+
+    def u8(a):
+        return Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8))
+    if detail > 0:                                  # local contrast with a wide radius
+        r2 = max(6.0, 0.02 * long)
+        blur = np.asarray(u8(Yf).filter(ImageFilter.GaussianBlur(r2)), dtype=np.float32)
+        Yf = Yf + (detail / 100.0 * 1.6) * (Yf - blur)
+    if sharp > 0:                                   # edge sharpening with a small radius
+        r1 = float(np.clip(0.0008 * long, 0.6, 3.0))
+        im = u8(Yf)
+        blur = np.asarray(im.filter(ImageFilter.GaussianBlur(r1)), dtype=np.float32)
+        d = Yf - blur
+        d = np.sign(d) * np.maximum(np.abs(d) - 2.0, 0.0)          # ignore tiny noise
+        Ys = Yf + (sharp / 100.0 * 2.5) * d
+        k = int(2 * math.ceil(r1) + 1)
+        k = max(3, k)
+        mn = np.asarray(im.filter(ImageFilter.MinFilter(k)), dtype=np.float32)
+        mx = np.asarray(im.filter(ImageFilter.MaxFilter(k)), dtype=np.float32)
+        margin = 0.3 * (mx - mn) + 2.0
+        Yf = np.clip(Ys, mn - margin, mx + margin)
+    out = x + (Yf - Y)[..., None]
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def focus_overlay(rgb8, mask):
+    """Shows which part of the picture a colour / shade selects (for the screen only, never saved)."""
+    m = np.clip(mask, 0, 1)[..., None]
+    x = rgb8.astype(np.float32)
+    x = x * (1.0 - 0.18 * (1 - m))
+    tint = np.array([255.0, 40.0, 200.0], dtype=np.float32)
+    x = x * (1 - 0.62 * m) + tint * (0.62 * m)
+    return np.clip(x + 0.5, 0, 255).astype(np.uint8)
 
 
 def active_adjs(adjs):
     return [a for a in adjs if a["k"] != 100]
 
 
-def render(rgb_u8, adjs, lab=None, cache=None):
-    """Apply all adjustments to a uint8 picture. lab / cache let the preview reuse earlier work."""
+def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, focus=None, chunk_rows=0):
+    """The whole edit chain on a uint8 picture.  lab / cache let the live preview reuse earlier work."""
     act = active_adjs(adjs)
+    dec = [a for a in act if a["k"] < 100]
     if cache is not None:
-        keep = {adj_key(a) for a in adjs}
+        keep = {("m",) + adj_key(a) for a in adjs}
+        keep.add(("f",) + tuple(adj_key(a) for a in dec))
         for k in [k for k in cache if k not in keep]:
             del cache[k]
-    if not act:
-        return rgb_u8
-    if lab is None:
-        lab = rgb_to_lab(rgb_u8)
-    out = rgb_u8.astype(np.float32)
-    for a in act:
-        key = adj_key(a)
-        m = cache.get(key) if cache is not None else None
-        if m is None:
-            m = adj_mask(lab, a)
-            if cache is not None:
-                cache[key] = m
-        apply_k(out, m, a["k"])
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    if not act and sat == 100 and sharp <= 0 and detail <= 0 and focus is None:
+        return rgb
+    H, W = rgb.shape[:2]
+    masks = {a["id"]: get_mask(rgb, a, lab, cache) for a in act}
+    F = get_fill(rgb, [masks[a["id"]] for a in dec], [adj_key(a) for a in dec], cache) if dec else None
+    out8 = np.empty_like(rgb)
+    rows = chunk_rows or H
+    for y0 in range(0, H, rows):
+        y1 = min(H, y0 + rows)
+        x = rgb[y0:y1].astype(np.float32)
+        for a in act:
+            m = masks[a["id"]][y0:y1]
+            if a["k"] < 100:
+                x += (F[y0:y1].astype(np.float32) - x) * (m * ((100 - a["k"]) / 100.0))[..., None]
+            else:
+                t = min((a["k"] - 100) / 100.0, 1.0)
+                mm = (m * t)[..., None]
+                if a["type"] == "color":      # clearer, stronger colour
+                    g = (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114)[..., None]
+                    x = g + (x - g) * (1.0 + 1.3 * mm)
+                    x *= (1.0 - 0.28 * mm)
+                else:                          # black / gray shade: darker
+                    x *= (1.0 - mm)
+        x = _saturate(x, sat)
+        out8[y0:y1] = np.clip(x + 0.5, 0, 255).astype(np.uint8)
+    if sharp > 0 or detail > 0:
+        out8 = clarity(out8, sharp, detail)
+    if focus is not None:
+        out8 = focus_overlay(out8, get_mask(rgb, focus, lab, cache))
+    return out8
 
 
-def render_full(img, adjs, chunk_rows=600):
-    """Full resolution result as a PIL image (done in strips, so big photos stay light on memory)."""
-    if not active_adjs(adjs):
+def render_full(img, adjs, sat=100, sharp=0, detail=0):
+    """Full resolution result as a PIL image."""
+    if not active_adjs(adjs) and sat == 100 and sharp <= 0 and detail <= 0:
         return img
     arr = np.asarray(img)
-    out = np.empty_like(arr)
-    for y in range(0, arr.shape[0], chunk_rows):
-        out[y:y + chunk_rows] = render(arr[y:y + chunk_rows], adjs)
-    return Image.fromarray(out)
+    return Image.fromarray(render(arr, adjs, sat, sharp, detail, chunk_rows=700))
 
 
 # -------------------------------------------------------- shade detection
@@ -358,6 +542,84 @@ def crop_box(img, box):
     if r - l < 2 or b - t < 2:
         raise ValueError("The crop area is too small")
     return img.crop((l, t, r, b))
+
+
+# ------------------------------------------------------------- eraser / clone
+def make_mask(size, shape, data, brush=20.0):
+    """Mask (PIL 'L', 255 = erase) from what the user drew, in real picture pixels.
+    shape: 'brush' (list of points, brush = width), 'rect' / 'ellipse' ((x0,y0,x1,y1)), 'lasso' (list of points)."""
+    m = Image.new("L", size, 0)
+    d = ImageDraw.Draw(m)
+    if shape == "brush":
+        w = max(1.0, float(brush))
+        r = w / 2.0
+        pts = [(float(x), float(y)) for x, y in data]
+        if len(pts) > 1:
+            d.line(pts, fill=255, width=int(round(w)), joint="curve")
+        for x, y in pts[:: max(1, len(pts) // 400)] + pts[-1:]:
+            d.ellipse((x - r, y - r, x + r, y + r), fill=255)
+    elif shape == "rect":
+        x0, y0, x1, y1 = data
+        d.rectangle((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), fill=255)
+    elif shape == "ellipse":
+        x0, y0, x1, y1 = data
+        d.ellipse((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), fill=255)
+    elif shape == "lasso":
+        pts = [(float(x), float(y)) for x, y in data]
+        if len(pts) >= 3:
+            d.polygon(pts, fill=255)
+    return m
+
+
+def erase_region(img, mask, offset=None, feather=1.5):
+    """Removes what is under the mask and puts there what surrounds it, so it looks as if nothing was there.
+    offset=(dx,dy): copy from that spot instead (clone / heal): the texture comes from (x+dx, y+dy),
+    the brightness and colour are matched to the surroundings."""
+    hard = mask.point(lambda v: 255 if v > 16 else 0)
+    bbox = hard.getbbox()
+    if bbox is None:
+        return img
+    W, H = img.size
+    bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    m = max(24, int(0.6 * max(bw, bh)))
+    box = (max(0, bbox[0] - m), max(0, bbox[1] - m), min(W, bbox[2] + m), min(H, bbox[3] + m))
+    full = np.asarray(img)
+    reg = full[box[1]:box[3], box[0]:box[2]].copy()
+    hole_img = hard.crop(box).filter(ImageFilter.MaxFilter(5))
+    hole = np.asarray(hole_img, dtype=np.float32) / 255.0
+    valid = 1.0 - hole
+    F = fill_background(reg, valid).astype(np.float32)
+
+    # soft edge: grow a little, then blur, so nothing of the old picture is left at the border
+    f = max(0.8, float(feather))
+    k = 2 * int(math.ceil(f)) + 1
+    soft = np.asarray(mask.crop(box).filter(ImageFilter.MaxFilter(max(3, k))).filter(ImageFilter.GaussianBlur(f)),
+                      dtype=np.float32) / 255.0
+    soft = np.clip(soft, 0, 1)[..., None]
+
+    ring = (np.asarray(hole_img.filter(ImageFilter.MaxFilter(25)), dtype=np.float32) / 255.0 > 0.5) & (hole < 0.5)
+    if offset is None:
+        # grain: add noise like the surrounding picture has, so the patch does not look too flat
+        sm = np.asarray(Image.fromarray(reg).filter(ImageFilter.GaussianBlur(1.2)), dtype=np.float32)
+        hf = reg.astype(np.float32) - sm
+        res = F
+        if int(ring.sum()) > 80:
+            h = hf[ring]
+            sig = 1.4826 * np.median(np.abs(h - np.median(h, axis=0)), axis=0)     # robust: text edges do not count
+            rng = np.random.default_rng(12345)
+            res = F + rng.standard_normal(F.shape).astype(np.float32) * sig * 0.9
+    else:
+        dx, dy = int(round(offset[0])), int(round(offset[1]))
+        ys = np.clip(np.arange(box[1], box[3]) + dy, 0, H - 1)
+        xs = np.clip(np.arange(box[0], box[2]) + dx, 0, W - 1)
+        src = full[np.ix_(ys, xs)].astype(np.float32)
+        res = src
+        if int(ring.sum()) > 50:                   # heal: same texture, but the tone of the new surroundings
+            res = src + (np.median(reg[ring].astype(np.float32), axis=0) - np.median(src[ring], axis=0))
+    out = reg.astype(np.float32) * (1 - soft) + res * soft
+    result = img.copy()
+    result.paste(Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)), (box[0], box[1]))
+    return result
 
 
 # --------------------------------------------------------------------- save
