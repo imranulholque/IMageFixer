@@ -5,7 +5,7 @@ import os
 import uuid
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -363,8 +363,10 @@ def active_adjs(adjs):
     return [a for a in adjs if a["k"] != 100]
 
 
-def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_rows=0):
-    """The whole edit chain on a uint8 picture.  lab / cache let the live preview reuse earlier work."""
+def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_rows=0, sel=None):
+    """The whole edit chain on a uint8 picture.  lab / cache let the live preview reuse earlier work.
+    sel = optional float mask (same size) 0..1: colour edits only act inside it.
+    Rows that no edit touches are copied as they are, so a small selection costs almost nothing."""
     act = active_adjs(adjs)
     dec = [a for a in act if a["k"] < 100]
     if cache is not None:
@@ -377,6 +379,7 @@ def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_ro
         return rgb
     H, W = rgb.shape[:2]
     masks = {a["id"]: get_mask(rgb, a, lab, cache) for a in act}
+    # the fill must avoid ALL matching pixels, also the ones outside the selection
     F = get_fill(rgb, [masks[a["id"]] for a in dec], [adj_key(a) for a in dec], cache) if dec else None
     grown = {}
     for a in dec:
@@ -388,16 +391,30 @@ def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_ro
                 if cache is not None:
                     cache[gk] = g
             grown[a["id"]] = g
+    rowmax = {k: m.max(1) for k, m in masks.items()}
+    sel_rows = None if sel is None else sel.max(1)
     out8 = np.empty_like(rgb)
-    rows = chunk_rows or H
+    rows = chunk_rows or 256
     for y0 in range(0, H, rows):
         y1 = min(H, y0 + rows)
+        touched = sat != 100 or any(float(r[y0:y1].max()) > 0.004 for r in rowmax.values())
+        if touched and sel_rows is not None and sat == 100 and float(sel_rows[y0:y1].max()) <= 0.004:
+            touched = False
+        if not touched:
+            out8[y0:y1] = rgb[y0:y1]
+            continue
         x = rgb[y0:y1].astype(np.float32)
+        s = None if sel is None else sel[y0:y1]
         for a in act:
             m = masks[a["id"]][y0:y1]
+            if s is not None:
+                m = m * s
             if a["k"] < 100 and a["type"] == "color":
+                gm = grown[a["id"]][y0:y1]
+                if s is not None:
+                    gm = gm * s
                 x = unmix_ink(x, F[y0:y1].astype(np.float32), np.array(a["rgb"], np.float32),
-                              grown[a["id"]][y0:y1], (100 - a["k"]) / 100.0, a["tol"])
+                              gm, (100 - a["k"]) / 100.0, a["tol"])
             elif a["k"] < 100:
                 x += (F[y0:y1].astype(np.float32) - x) * (m * ((100 - a["k"]) / 100.0))[..., None]
             else:
@@ -416,12 +433,13 @@ def render(rgb, adjs, sat=100, sharp=0, detail=0, lab=None, cache=None, chunk_ro
     return out8
 
 
-def render_full(img, adjs, sat=100, sharp=0, detail=0):
-    """Full resolution result as a PIL image."""
+def render_full(img, adjs, sat=100, sharp=0, detail=0, sel=None):
+    """Full resolution result as a PIL image.  sel = selection mask at preview size (or None)."""
     if not active_adjs(adjs) and sat == 100 and sharp <= 0 and detail <= 0:
         return img
     arr = np.asarray(img)
-    return Image.fromarray(render(arr, adjs, sat, sharp, detail, chunk_rows=700))
+    full_sel = None if sel is None else resize_mask(sel, img.size)
+    return Image.fromarray(render(arr, adjs, sat, sharp, detail, chunk_rows=700, sel=full_sel))
 
 
 # -------------------------------------------------------- shade detection
@@ -495,30 +513,88 @@ def classify_pick(lab_img, rgb):
 
 
 # ------------------------------------------------------------ shadow removal
-def _dilate(a, r):
+def _max_filter_bool(m, r):
+    """grow a boolean mask by r pixels (fast: PIL does the work)."""
+    if r <= 0:
+        return m
+    im = Image.fromarray((m * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(2 * int(r) + 1))
+    return np.asarray(im) > 127
+
+
+def _block_max(a, f):
     h, w = a.shape[:2]
-    p = np.pad(a, ((r, r), (r, r), (0, 0)), mode="edge")
-    out = a.copy()
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            out = np.maximum(out, p[r + dy:r + dy + h, r + dx:r + dx + w])
-    return out
+    ph, pw = -(-h // f) * f, -(-w // f) * f
+    pad = np.pad(a, ((0, ph - h), (0, pw - w), (0, 0)), mode="edge")
+    return pad.reshape(ph // f, f, pw // f, f, a.shape[2]).max(axis=(1, 3))
 
 
-def remove_shadow(img):
-    """Evens out paper lighting (shadows, uneven light) and whitens the page; text stays."""
+def _filter_rgb(a, filt):
+    """PIL filter on each channel of a float picture (values 0..255)."""
+    return np.stack([np.asarray(Image.fromarray(np.clip(a[..., c] + 0.5, 0, 255).astype(np.uint8)).filter(filt),
+                                dtype=np.float32) for c in range(a.shape[2])], -1)
+
+
+def estimate_paper(small, progress=None):
+    """Smooth picture of the paper lighting (float32 h,w,3) for a working-size uint8 picture.
+    Pass 1 = coarse guess from block maxima.  Pass 2 = throw away everything that is ink OR sits on an edge
+    (text, stamps, lines, and a margin around them where soft shadows / blur live) and fill the holes
+    from the clean paper around - so ink and its fringe never leak into the lighting estimate."""
+    h, w = small.shape[:2]
+    a = small.astype(np.float32)
+    f = max(4, int(round(max(h, w) / 60)))
+    cm = _block_max(a, f)
+    cm = _filter_rgb(cm, ImageFilter.MaxFilter(3))
+    bg1 = _filter_rgb(_up(cm, h, w), ImageFilter.GaussianBlur(f * 0.6))
+    bg1 = np.maximum(bg1, 40.0)
+    if progress:
+        progress(0.35, "Looking for text and edges")
+    lum = a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+    lum1 = bg1[..., 0] * 0.299 + bg1[..., 1] * 0.587 + bg1[..., 2] * 0.114
+    ratio = lum / lum1
+    ink = ratio < 0.90
+    sm = np.asarray(Image.fromarray(np.clip(lum + 0.5, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.8)),
+                    dtype=np.float32)
+    gy, gx = np.gradient(sm)
+    edge = np.hypot(gx, gy) / lum1 > 0.035                       # relative edge strength: works in dark corners too
+    bad = _max_filter_bool(ink | edge, max(2, int(round(0.004 * max(h, w)))))
+    if progress:
+        progress(0.55, "Rebuilding the paper lighting")
+    if bad.mean() > 0.92:                                        # almost no clean paper: keep the coarse guess
+        return bg1
+    valid = (~bad).astype(np.float32)
+    bg = fill_background(small, valid).astype(np.float32)
+    # where the paper is dark because of a real shadow the fill follows it; never brighter than the lightest paper
+    return np.maximum(bg, 40.0)
+
+
+def remove_shadow(img, strength=1.0, progress=None):
+    """Evens out paper lighting (shadows, uneven light) and whitens the page; text, stamps and shapes stay.
+    strength 0..1 blends between the original and the fully corrected result."""
     arr = np.asarray(img)
     H, W = arr.shape[:2]
-    f = max(8, int(round(max(H, W) / 100)))
-    ph, pw = -(-H // f) * f, -(-W // f) * f
-    pad = np.pad(arr, ((0, ph - H), (0, pw - W), (0, 0)), mode="edge")
-    small = pad.reshape(ph // f, f, pw // f, f, 3).max(axis=(1, 3))     # page brightness, text removed
-    small = _dilate(small, 2)
-    sm_img = Image.fromarray(small).filter(ImageFilter.GaussianBlur(2))
-    bg = np.asarray(sm_img.resize((pw, ph), Image.Resampling.BICUBIC))[:H, :W].astype(np.float32)
-    bg = np.maximum(bg, 40.0)
-    out = arr.astype(np.float32) * (255.0 / bg)
-    return Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8))
+    ws = 1100.0 / max(H, W)
+    if ws < 1.0:
+        small = np.asarray(img.resize((max(8, round(W * ws)), max(8, round(H * ws))), Image.Resampling.BOX))
+    else:
+        small = arr
+    if progress:
+        progress(0.1, "Measuring the lighting")
+    bg = estimate_paper(small, progress)
+    gain = 255.0 / bg
+    s = float(max(0.0, min(1.0, strength)))
+    gain = np.clip(1.0 + (gain - 1.0) * s, 0.5, 4.0).astype(np.float32)
+    gh, gw = gain.shape[:2]
+    out = np.empty_like(arr)
+    step = 600
+    for y0 in range(0, H, step):
+        y1 = min(H, y0 + step)
+        box = (0.0, y0 * gh / H, float(gw), y1 * gh / H)
+        g = np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(gain[..., c])).resize(
+            (W, y1 - y0), Image.Resampling.BICUBIC, box=box), dtype=np.float32) for c in range(3)], -1)
+        out[y0:y1] = np.clip(arr[y0:y1].astype(np.float32) * g + 0.5, 0, 255).astype(np.uint8)
+        if progress:
+            progress(0.7 + 0.3 * y1 / H, "Applying")
+    return Image.fromarray(out)
 
 
 # --------------------------------------------------------------------- crop
@@ -646,7 +722,7 @@ def erase_region(img, mask, offset=None, feather=1.5):
 
 
 # --------------------------------------------------------------------- save
-SAVE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+SAVE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".pdf"}
 
 
 def out_ext(src_name):
@@ -673,5 +749,202 @@ def save_image(img, path):
         img.save(path, "TIFF", compression="tiff_lzw")
     elif e == ".bmp":
         img.save(path, "BMP")
+    elif e == ".pdf":
+        save_pdf([img], path)
     else:
         img.save(path, "PNG")
+
+
+# ------------------------------------------------------------------- selection
+# A selection is a float32 mask (0..1) at preview size, or None = nothing selected (edits act on the whole picture).
+def resize_mask(m, size):
+    """size = (width, height) in pixels."""
+    w, h = size
+    if m.shape[1] == w and m.shape[0] == h:
+        return m
+    im = Image.fromarray(np.ascontiguousarray(m, dtype=np.float32))
+    return np.asarray(im.resize((w, h), Image.Resampling.BILINEAR), dtype=np.float32)
+
+
+def sel_combine(old, new, mode):
+    """mode: 'new' | 'add' | 'sub'.  Returns the new selection (None when empty)."""
+    if mode == "add" and old is not None:
+        out = np.maximum(old, new)
+    elif mode == "sub":
+        if old is None:
+            return None
+        out = old * (1.0 - new)
+    else:
+        out = new
+    return out.astype(np.float32) if float(out.max()) > 0.02 else None
+
+
+def sel_coverage(m):
+    return 0.0 if m is None else float((m > 0.5).mean())
+
+
+def shape_mask(size, shape, data, brush=20.0):
+    """Float mask from a drawn rectangle / ellipse / lasso / brush (coordinates in the same pixels as size=(w,h))."""
+    return np.asarray(make_mask(size, shape, data, brush), dtype=np.float32) / 255.0
+
+
+def color_range_mask(lab, rgb, tol=30.0):
+    """Every pixel whose colour is close to rgb (like Photoshop's Color Range with 'fuzziness' = tol)."""
+    pt = rgb_to_lab(np.array([[list(rgb)]], dtype=np.uint8))[0, 0]
+    d = np.sqrt(((lab[..., 0] - pt[0]) * 0.8) ** 2 + (lab[..., 1] - pt[1]) ** 2 + (lab[..., 2] - pt[2]) ** 2)
+    inner, outer = tol * 0.7, tol * 1.3
+    return (1.0 - _smooth((d - inner) / (outer - inner))).astype(np.float32)
+
+
+def quick_select(lab, stroke, tol=28.0):
+    """Brush over an object: the selection grows from the stroke over connected pixels that look like what was
+    brushed, and stops at the object's boundary (where the colour changes)."""
+    H, W = stroke.shape
+    ys, xs = np.nonzero(stroke > 0.5)
+    if ys.size == 0:
+        return np.zeros((H, W), np.float32)
+    margin = int(max(60, 0.3 * max(H, W)))
+    y0, y1 = max(0, int(ys.min()) - margin), min(H, int(ys.max()) + 1 + margin)
+    x0, x1 = max(0, int(xs.min()) - margin), min(W, int(xs.max()) + 1 + margin)
+    sub = lab[y0:y1, x0:x1]
+    st = stroke[y0:y1, x0:x1] > 0.5
+    vals = sub[st]
+    ref = np.median(vals, axis=0)
+    spread = float(np.mean(1.4826 * np.median(np.abs(vals - ref), axis=0)))
+    thr = tol + min(18.0, 2.0 * spread)
+    d = np.sqrt(((sub[..., 0] - ref[0]) * 0.8) ** 2 + (sub[..., 1] - ref[1]) ** 2 + (sub[..., 2] - ref[2]) ** 2)
+    soft = 1.0 - _smooth((d - thr * 0.75) / (thr * 0.5))
+    cand = soft > 0.5
+    seed = st & cand
+    if not seed.any():
+        seed = st
+    cur = Image.fromarray((seed * 255).astype(np.uint8))
+    allow = Image.fromarray((cand * 255).astype(np.uint8))
+    prev_n = int(seed.sum())
+    for _ in range(max(6, margin // 2)):               # grow only through matching pixels (stays connected)
+        nxt = ImageChops.multiply(cur.filter(ImageFilter.MaxFilter(5)), allow)
+        n = int(np.count_nonzero(np.asarray(nxt)))
+        cur = nxt
+        if n == prev_n:
+            break
+        prev_n = n
+    region = np.asarray(cur, dtype=np.float32) / 255.0
+    region = np.maximum(region * soft, st.astype(np.float32))
+    region = np.asarray(Image.fromarray((region * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.8)),
+                        dtype=np.float32) / 255.0
+    out = np.zeros((H, W), np.float32)
+    out[y0:y1, x0:x1] = region
+    return out
+
+
+def shift_mask(m, dx, dy):
+    """The same selection moved by (dx, dy) pixels; what leaves the picture is cut off."""
+    H, W = m.shape
+    out = np.zeros_like(m)
+    sx0, sx1 = max(0, -dx), min(W, W - dx)
+    sy0, sy1 = max(0, -dy), min(H, H - dy)
+    if sx1 > sx0 and sy1 > sy0:
+        out[sy0 + dy:sy1 + dy, sx0 + dx:sx1 + dx] = m[sy0:sy1, sx0:sx1]
+    return out
+
+
+def move_region(img, mask, dx, dy, copy=False, feather=1.5):
+    """Takes the selected part of the picture to another place.  mask = PIL 'L' mask at the picture's size.
+    copy=False: the old place is filled from its surroundings (like erasing it); copy=True: it stays."""
+    hard = mask.point(lambda v: 255 if v > 16 else 0)
+    bbox = hard.getbbox()
+    if bbox is None:
+        return img
+    base = img.copy() if copy else erase_region(img, mask, None, feather)
+    patch = img.crop(bbox)
+    pm = mask.crop(bbox).filter(ImageFilter.GaussianBlur(0.8))
+    base.paste(patch, (bbox[0] + int(dx), bbox[1] + int(dy)), pm)
+    return base
+
+
+# --------------------------------------------------------------------- rotate
+def border_color(img):
+    a = np.asarray(img)
+    edge = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]], 0)
+    return tuple(int(v) for v in np.median(edge, axis=0))
+
+
+def rotate_image(img, deg_ccw):
+    """Turn the picture counter-clockwise by deg_ccw degrees. Multiples of 90 are lossless; any other angle
+    makes the picture bigger and fills the corners with the colour of the picture's border."""
+    d = float(deg_ccw) % 360.0
+    if abs(d) < 1e-6 or abs(d - 360.0) < 1e-6:
+        return img
+    for angle, t in ((90.0, Image.Transpose.ROTATE_90), (180.0, Image.Transpose.ROTATE_180),
+                     (270.0, Image.Transpose.ROTATE_270)):
+        if abs(d - angle) < 1e-6:
+            return img.transpose(t)
+    return img.rotate(d, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=border_color(img))
+
+
+# ------------------------------------------------------------------------ PDF
+PAGE_SIZES = {"a4": (595.276, 841.89), "letter": (612.0, 792.0)}
+
+
+def pdf_page(w, h, mode):
+    """(page width, page height, image x, y, drawn width, drawn height) in PDF points.
+    'fit'  : the page has the picture's own proportions (nothing is cut or padded)
+    'a4' / 'letter' : standard paper, turned to match the picture, picture centred and as big as it fits."""
+    if mode in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[mode]
+        if w > h:
+            pw, ph = ph, pw
+        sc = min(pw / w, ph / h)
+        dw, dh = w * sc, h * sc
+        return pw, ph, (pw - dw) / 2, (ph - dh) / 2, dw, dh
+    long = 841.89                                      # long side = A4 long side, short side follows the picture
+    sc = long / max(w, h)
+    return w * sc, h * sc, 0.0, 0.0, w * sc, h * sc
+
+
+def save_pdf(sources, path, mode="fit", quality=95, progress=None):
+    """One PDF, one page per picture, in the given order.  sources = list of PIL images or functions that return one
+    (so a long list never sits in memory all at once).  The picture is embedded at full resolution as high-quality
+    JPEG (4:4:4, nothing is resized)."""
+    import io
+    n = len(sources)
+    if n == 0:
+        raise ValueError("Nothing to save")
+    offsets = {}
+    with open(path, "wb") as f:
+        f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+        def put(num, body):
+            offsets[num] = f.tell()
+            f.write(b"%d 0 obj\n" % num + body + b"\nendobj\n")
+
+        for i, src in enumerate(sources):
+            if progress:
+                progress(i / n, "Page %d of %d" % (i + 1, n))
+            im = src() if callable(src) else src
+            im = im.convert("RGB")
+            w, h = im.size
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=quality, subsampling=0, optimize=True)
+            data = buf.getvalue()
+            pw, ph, x, y, dw, dh = pdf_page(w, h, mode)
+            base = 3 + 3 * i
+            put(base, ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /Resources << /XObject << /Im0 %d 0 R >> "
+                       "/ProcSet [/PDF /ImageC] >> /Contents %d 0 R >>" % (pw, ph, base + 2, base + 1)).encode())
+            content = ("q %.3f 0 0 %.3f %.3f %.3f cm /Im0 Do Q" % (dw, dh, x, y)).encode()
+            put(base + 1, b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+            put(base + 2, b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB "
+                          b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n" % (w, h, len(data))
+                + data + b"\nendstream")
+            del im, data, buf
+        kids = " ".join("%d 0 R" % (3 + 3 * i) for i in range(n))
+        put(2, ("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, n)).encode())
+        put(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+        total = 3 + 3 * n
+        xref = f.tell()
+        f.write(b"xref\n0 %d\n0000000000 65535 f \n" % total)
+        for num in range(1, total):
+            f.write(b"%010d 00000 n \n" % offsets[num])
+        f.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (total, xref))
+    if progress:
+        progress(1.0, "Done")

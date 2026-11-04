@@ -23,8 +23,10 @@ class ImageCanvas(QWidget):
     cancelRequested = Signal()            # Esc while cropping / erasing
     eraseFinished = Signal(str, object)   # ('brush'|'rect'|'ellipse'|'lasso', points) in picture pixels
     sourcePicked = Signal(float, float)   # Alt + click: spot to copy from (clone)
+    selectFinished = Signal(str, object, str)   # ('quick'|'rect'|'lasso'|'color', data, ''|'add'|'sub') preview pixels
+    moveFinished = Signal(int, int, bool)       # dx, dy (preview pixels), True = copy (original stays)
 
-    VIEW, PICK, CROP, PERSP, ERASE = 0, 1, 2, 3, 4
+    VIEW, PICK, CROP, PERSP, ERASE, SELECT, MOVESEL = 0, 1, 2, 3, 4, 5, 6
     HIT = 11
     MIN_CROP = 8.0
 
@@ -52,10 +54,16 @@ class ImageCanvas(QWidget):
         self.clone_src = None                 # QPointF, spot to copy from
         self.clone_delta = None               # QPointF, offset source - destination
         self._msg = "Loading..."
-        self._sel = None                      # float mask (preview size) or None
+        self._masks = {"sel": None, "hl": None}      # float masks (preview size): the selection / the hovered colour
+        self._mver = {"sel": 0, "hl": 0}
+        self._edge_cache = {}
         self.sel_visible = True
-        self._ants_key = None
-        self._ants = None
+        self.select_shape = "quick"
+        self.copy_mode = False
+        self.quick_prev = 20.0                # quick-select brush size in preview pixels
+        self._float = None                    # lifted pixels while moving a selection: (QImage, x, y)
+        self._float_start = None
+        self._float_d = (0, 0)
         self._phase = 0
         self._ants_timer = QTimer(self)
         self._ants_timer.setInterval(120)
@@ -92,10 +100,21 @@ class ImageCanvas(QWidget):
 
     # ------------------------------------------------------ marching ants
     def set_selection(self, mask):
-        self._sel = mask
-        self._ants_key = None
+        """The selection (persistent outline). None = nothing selected."""
+        self._masks["sel"] = mask
+        self._mver["sel"] += 1
         self._sync_ants()
         self.update()
+
+    def set_highlight(self, mask):
+        """Outline of the colour the mouse points at in the colour list."""
+        self._masks["hl"] = mask
+        self._mver["hl"] += 1
+        self._sync_ants()
+        self.update()
+
+    def selection_mask(self):
+        return self._masks["sel"]
 
     def set_selection_visible(self, on):
         self.sel_visible = bool(on)
@@ -103,7 +122,7 @@ class ImageCanvas(QWidget):
         self.update()
 
     def _sync_ants(self):
-        if self._sel is not None and self.sel_visible:
+        if (self._masks["sel"] is not None or self._masks["hl"] is not None) and self.sel_visible:
             if not self._ants_timer.isActive():
                 self._ants_timer.start()
         else:
@@ -113,39 +132,45 @@ class ImageCanvas(QWidget):
         self._phase = (self._phase + 1) % 8
         self.update()
 
-    def _ants_edges(self):
-        key = (round(self.zoom, 4), round(self.off.x()), round(self.off.y()), self.width(), self.height())
-        if self._ants_key != key:
-            w, h = self.width(), self.height()
-            H, W = self._sel.shape
-            ix = ((np.arange(w) - self.off.x()) / self.zoom).astype(np.int64)
-            iy = ((np.arange(h) - self.off.y()) / self.zoom).astype(np.int64)
-            okx, oky = (ix >= 0) & (ix < W), (iy >= 0) & (iy < H)
-            m = np.zeros((h, w), dtype=bool)
-            if okx.any() and oky.any():
-                sub = self._sel[np.clip(iy, 0, H - 1)][:, np.clip(ix, 0, W - 1)] > 0.5
-                m = sub & oky[:, None] & okx[None, :]
-            e = m.copy()
-            e[1:-1, 1:-1] &= m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:]
-            e[0, :] &= False
-            e[-1, :] &= False
-            e[:, 0] &= False
-            e[:, -1] &= False
-            edge = m & ~e
-            ys, xs = np.nonzero(edge)
-            self._ants = (ys, xs)
-            self._ants_key = key
-        return self._ants
+    def _edges(self, name):
+        """Boundary pixels (in widget pixels) of a mask, recomputed only when the view or the mask changed."""
+        m = self._masks[name]
+        key = (self._mver[name], round(self.zoom, 4), round(self.off.x()), round(self.off.y()),
+               self.width(), self.height())
+        hit = self._edge_cache.get(name)
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2]
+        w, h = self.width(), self.height()
+        H, W = m.shape
+        ix = ((np.arange(w) - self.off.x()) / self.zoom).astype(np.int64)
+        iy = ((np.arange(h) - self.off.y()) / self.zoom).astype(np.int64)
+        okx, oky = (ix >= 0) & (ix < W), (iy >= 0) & (iy < H)
+        mm = np.zeros((h, w), dtype=bool)
+        if okx.any() and oky.any():
+            sub = m[np.clip(iy, 0, H - 1)][:, np.clip(ix, 0, W - 1)] > 0.5
+            mm = sub & oky[:, None] & okx[None, :]
+        inner = mm.copy()
+        inner[1:-1, 1:-1] &= mm[:-2, 1:-1] & mm[2:, 1:-1] & mm[1:-1, :-2] & mm[1:-1, 2:]
+        inner[0, :] = False
+        inner[-1, :] = False
+        inner[:, 0] = False
+        inner[:, -1] = False
+        ys, xs = np.nonzero(mm & ~inner)
+        self._edge_cache[name] = (key, ys, xs)
+        return ys, xs
 
-    def _paint_ants(self, p):
-        ys, xs = self._ants_edges()
+    def _paint_ants(self, p, name, dark, light):
+        if self._masks[name] is None:
+            return
+        ys, xs = self._edges(name)
         if ys.size == 0:
             return
-        buf = np.zeros((self.height(), self.width(), 4), dtype=np.uint8)
-        on = ((xs + ys + self._phase * 1) // 4) % 2 == 0
-        buf[ys, xs] = np.where(on[:, None], np.array([0, 0, 0, 255], np.uint8), np.array([255, 255, 255, 255], np.uint8))
+        y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+        buf = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
+        on = ((xs + ys + self._phase) // 4) % 2 == 0
+        buf[ys - y0, xs - x0] = np.where(on[:, None], np.array(dark, np.uint8), np.array(light, np.uint8))
         img = QImage(buf.data, buf.shape[1], buf.shape[0], buf.shape[1] * 4, QImage.Format.Format_RGBA8888)
-        p.drawImage(0, 0, img.copy())
+        p.drawImage(x0, y0, img.copy())
 
     def has_image(self):
         return self._img is not None
@@ -209,11 +234,15 @@ class ImageCanvas(QWidget):
             self._clamp()
 
     # --------------------------------------------------------------- mode
-    def set_mode(self, m):
+    def set_mode(self, m, shape=None):
         self.mode = m
+        if shape is not None:
+            self.select_shape = shape
         self._drag = None
         self._erase = None
         iw, ih = self._iw, self._ih
+        if m != self.MOVESEL:
+            self._float = None
         if m == self.CROP and iw:
             self._crop = QRectF(iw * 0.05, ih * 0.05, iw * 0.9, ih * 0.9)
         if m == self.PERSP and iw:
@@ -229,6 +258,10 @@ class ImageCanvas(QWidget):
 
     def quad_img(self):
         return [(q.x(), q.y()) for q in self._quad]
+
+    def set_quick_brush(self, size_prev):
+        self.quick_prev = max(1.0, float(size_prev))
+        self.update()
 
     def set_erase(self, shape):
         self.erase_shape = shape
@@ -258,8 +291,11 @@ class ImageCanvas(QWidget):
         p.scale(self.zoom, self.zoom)
         p.drawImage(0, 0, self._img)
         p.restore()
-        if self._sel is not None and self.sel_visible and self.mode in (self.VIEW, self.PICK):
-            self._paint_ants(p)
+        if self._float is not None:
+            self._paint_float(p)
+        if self.sel_visible and self.mode not in (self.CROP, self.PERSP):
+            self._paint_ants(p, "sel", (0, 0, 0, 255), (255, 255, 255, 255))
+            self._paint_ants(p, "hl", (20, 30, 120, 255), (160, 190, 255, 255))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self.mode == self.CROP:
             self._paint_crop(p)
@@ -269,6 +305,50 @@ class ImageCanvas(QWidget):
             self._paint_loupe(p)
         elif self.mode == self.ERASE:
             self._paint_erase(p)
+        elif self.mode == self.SELECT:
+            self._paint_select(p)
+
+    def _paint_float(self, p):
+        img, x, y = self._float
+        dx, dy = self._float_d
+        tl = self.to_wid(QPointF(x + dx, y + dy))
+        p.save()
+        p.setOpacity(0.9)
+        p.drawImage(QRectF(tl.x(), tl.y(), img.width() * self.zoom, img.height() * self.zoom), img)
+        p.restore()
+        p.setPen(QPen(QColor(255, 255, 255), 1.2, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(tl.x(), tl.y(), img.width() * self.zoom, img.height() * self.zoom))
+
+    def _paint_select(self, p):
+        """Shape being drawn: only an outline (no coloured overlay), so the picture stays visible."""
+        z = self.zoom
+        er = self._erase
+        if er is not None:
+            pts = [self.to_wid(q) for q in er["pts"]]
+            kind = er["kind"]
+            for width, col in ((3.0, QColor(0, 0, 0, 200)), (1.4, QColor(255, 255, 255, 255))):
+                pen = QPen(col, width, Qt.PenStyle.DashLine if kind != "quick" else Qt.PenStyle.SolidLine)
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                if kind == "quick":
+                    p.setPen(QPen(QColor(255, 255, 255, 110) if width > 2 else QColor(99, 102, 241, 170),
+                                  max(1.0, self.quick_prev * z) if width > 2 else 1.4,
+                                  Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    if len(pts) > 1:
+                        p.drawPolyline(QPolygonF(pts))
+                elif kind == "lasso":
+                    p.drawPolygon(QPolygonF(pts)) if len(pts) > 2 else p.drawPolyline(QPolygonF(pts))
+                else:
+                    r = QRectF(pts[0], pts[-1]).normalized()
+                    p.drawRect(r)
+        if self.select_shape == "quick" and self._hover is not None:
+            r = max(2.0, self.quick_prev * z / 2)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(20, 24, 34), 3))
+            p.drawEllipse(self._hover, r, r)
+            p.setPen(QPen(QColor(255, 255, 255), 1.4))
+            p.drawEllipse(self._hover, r, r)
 
     def _paint_erase(self, p):
         z = self.zoom
@@ -479,6 +559,19 @@ class ImageCanvas(QWidget):
             i = self._persp_hit(pos)
             if i is not None:
                 self._drag = ("pt", i)
+        elif self.mode == self.SELECT:
+            mods = e.modifiers()
+            self._sel_mod = "add" if mods & Qt.KeyboardModifier.ShiftModifier else \
+                ("sub" if mods & Qt.KeyboardModifier.AltModifier else "")
+            if self.select_shape == "color":
+                if 0 <= ip.x() < self._iw and 0 <= ip.y() < self._ih:
+                    self.selectFinished.emit("color", (int(ip.x()), int(ip.y())), self._sel_mod)
+            else:
+                ip = self._inside(ip)
+                self._erase = {"kind": self.select_shape, "pts": [ip]}
+                self.update()
+        elif self.mode == self.MOVESEL:
+            self._start_float(ip, bool(e.modifiers() & Qt.KeyboardModifier.AltModifier) or self.copy_mode)
         elif self.mode == self.ERASE:
             if e.modifiers() & Qt.KeyboardModifier.AltModifier:
                 self.sourcePicked.emit(ip.x(), ip.y())
@@ -486,6 +579,25 @@ class ImageCanvas(QWidget):
                 ip = self._inside(ip)
                 self._erase = {"kind": self.erase_shape, "pts": [ip]}
                 self.update()
+
+    def _start_float(self, ip, copy):
+        m = self._masks["sel"]
+        if m is None or self._src is None:
+            return
+        H, W = m.shape
+        x, y = int(ip.x()), int(ip.y())
+        if not (0 <= x < W and 0 <= y < H) or m[y, x] <= 0.5:
+            return
+        ys, xs = np.nonzero(m > 0.5)
+        y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+        rgba = np.empty((y1 - y0, x1 - x0, 4), np.uint8)
+        rgba[..., :3] = self._src[y0:y1, x0:x1]
+        rgba[..., 3] = np.clip(m[y0:y1, x0:x1] * 255, 0, 255).astype(np.uint8)
+        img = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        self._float = (img, x0, y0)
+        self._float_start = (QPointF(ip), copy)
+        self._float_d = (0, 0)
+        self.update()
 
     def _cl(self, v, lo, hi):
         return max(lo, min(hi, v))
@@ -539,10 +651,16 @@ class ImageCanvas(QWidget):
         if self._drag is not None:
             self._do_drag(pos)
             return
+        if self._float_start is not None:
+            ip = self.to_img(pos)
+            a = self._float_start[0]
+            self._float_d = (int(round(ip.x() - a.x())), int(round(ip.y() - a.y())))
+            self.update()
+            return
         if self._erase is not None:
             ip = self._inside(self.to_img(pos))
             pts = self._erase["pts"]
-            if self._erase["kind"] in ("brush", "lasso"):
+            if self._erase["kind"] in ("brush", "lasso", "quick"):
                 last = pts[-1]
                 if math.hypot(ip.x() - last.x(), ip.y() - last.y()) >= max(1.0, 2.0 / self.zoom):
                     pts.append(ip)
@@ -550,13 +668,36 @@ class ImageCanvas(QWidget):
                 self._erase["pts"] = [pts[0], ip]
             self.update()
             return
-        if self.mode in (self.PICK, self.ERASE):
+        if self.mode in (self.PICK, self.ERASE, self.SELECT):
             self.update()
         elif self.mode in (self.CROP, self.PERSP):
             self._update_cursor(pos)
 
     def mouseReleaseEvent(self, e):
+        if self._float_start is not None and e.button() == Qt.MouseButton.LeftButton:
+            copy = self._float_start[1]
+            dx, dy = self._float_d
+            self._float_start = None
+            self._float = None
+            self._float_d = (0, 0)
+            self.update()
+            if abs(dx) + abs(dy) >= 2:
+                self.moveFinished.emit(dx, dy, copy)
+            self._pan_last = None
+            return
         er, self._erase = self._erase, None
+        if er is not None and self.mode == self.SELECT and e.button() == Qt.MouseButton.LeftButton:
+            pts, kind = er["pts"], er["kind"]
+            mod = getattr(self, "_sel_mod", "")
+            if kind == "quick":
+                self.selectFinished.emit("quick", [(q.x(), q.y()) for q in pts], mod)
+            elif kind == "lasso":
+                if len(pts) >= 3:
+                    self.selectFinished.emit("lasso", [(q.x(), q.y()) for q in pts], mod)
+            elif len(pts) == 2 and abs(pts[0].x() - pts[1].x()) >= 2 and abs(pts[0].y() - pts[1].y()) >= 2:
+                self.selectFinished.emit(kind, (pts[0].x(), pts[0].y(), pts[1].x(), pts[1].y()), mod)
+            self.update()
+            er = None
         if er is not None and e.button() == Qt.MouseButton.LeftButton:
             pts, kind = er["pts"], er["kind"]
             if kind in ("brush", "lasso"):
@@ -580,8 +721,10 @@ class ImageCanvas(QWidget):
             self.setCursor(C.OpenHandCursor)
         elif self.mode == self.PICK:
             self.setCursor(self._pick_cursor)
-        elif self.mode == self.ERASE:
+        elif self.mode in (self.ERASE, self.SELECT):
             self.setCursor(C.CrossCursor)
+        elif self.mode == self.MOVESEL:
+            self.setCursor(C.SizeAllCursor)
         elif self.mode == self.CROP:
             hit = self._crop_hit(pos) if pos is not None and self._img is not None else None
             shape = {"tl": C.SizeFDiagCursor, "br": C.SizeFDiagCursor, "tr": C.SizeBDiagCursor,
@@ -615,6 +758,10 @@ class ImageCanvas(QWidget):
     def keyPressEvent(self, e):
         if self.mode in (self.CROP, self.PERSP) and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.applyRequested.emit()
+            return
+        if self.mode == self.SELECT and e.key() == Qt.Key.Key_Escape:
+            self._erase = None
+            self.update()
             return
         if self.mode in (self.CROP, self.PERSP, self.ERASE) and e.key() == Qt.Key.Key_Escape:
             self.cancelRequested.emit()

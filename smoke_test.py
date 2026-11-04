@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import traceback
+import urllib.error
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QThreadPool
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 failed = []
 
@@ -50,6 +51,7 @@ def main():
     QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
     QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
     import ui
+    import core
     from canvas import ImageCanvas
     from theme import QSS
     app.setStyleSheet(QSS)
@@ -82,11 +84,18 @@ def main():
         assert not card.canvas.grab().isNull()
     step("window paints", paint)
 
+    def wait():
+        assert win.runner.wait_idle(60), "a background job did not finish"
+
     def pick():
-        card.tools[ImageCanvas.PICK].click()
+        card.tools["pick"].click()
         ys, xs = np.where(card.prev.astype(int).sum(2) < 90)
         card._on_pick(int(xs[0]), int(ys[0]))
-        assert card.panel.has_bands() and len([a for a in card.adjs if a["type"] == "band"]) >= 3, card.adjs
+        assert card.panel.has_bands() and len([a for a in card.adjs if a["type"] == "band"]) == 1, card.adjs
+        ys, xs = np.where((card.prev.astype(int).sum(2) > 230) & (card.prev.astype(int).sum(2) < 330)
+                          & (np.ptp(card.prev.astype(int), axis=2) < 6))
+        card._on_pick(int(xs[0]), int(ys[0]))                    # another shade: its own slider is added
+        assert len([a for a in card.adjs if a["type"] == "band"]) == 2, card.adjs
         r = card.prev.astype(int)
         ys, xs = np.where((r[..., 0] > 150) & (r[..., 1] < 80) & (r[..., 2] < 80))
         card._on_pick(int(xs[0]), int(ys[0]))
@@ -107,31 +116,39 @@ def main():
 
     def sliders():
         rows = card.panel._band_rows
-        rows[1].sl.setValue(0)
-        rows[2].sl.setValue(150)
-        card._render_now()
+        rows[0].sl.setValue(0)
+        rows[-1].sl.setValue(150)
+        card.render_sync()
         assert card.is_edited()
         img = card.result_image()
         assert img.size == card.base.size
         assert card.panel._rows and list(card.panel._rows.values())[0].rs is not None
-    step("sliders change the picture", sliders)
+        card._render_now()                                  # the threaded live preview
+        wait()
+        QThreadPool.globalInstance().waitForDone(5000)
+        app.processEvents()
+    step("sliders change the picture (and live preview thread)", sliders)
 
     def crop():
-        card.tools[ImageCanvas.CROP].click()
+        card.tools["crop"].click()
         card.canvas._crop = QRectF(100, 100, 400, 300)
         card._apply_crop()
+        wait()
         assert card.base.size == (400, 300), card.base.size
         card.undo_step()
+        wait()
         assert card.base.size == (900, 600)
     step("rectangle crop + undo", crop)
 
     def persp():
-        card.tools[ImageCanvas.PERSP].click()
+        card.tools["persp"].click()
         card.canvas._quad = [QPointF(50, 40), QPointF(850, 60), QPointF(870, 560), QPointF(30, 540)]
         assert not card.canvas.grab().isNull()
         card._apply_crop()
+        wait()
         assert card.base.size[0] > 700 and card.base.size[1] > 400, card.base.size
         card.undo_step()
+        wait()
         assert card.base.size == (900, 600)
     step("4-point crop + undo", persp)
 
@@ -145,60 +162,150 @@ def main():
 
     def shadow():
         n = card.ops
-        card._auto_shadow()
+        card.btnShadow.click()
+        wait()
         assert card.ops == n + 1
         card.undo_step()
-    step("auto shadow + undo", shadow)
+        wait()
+    step("shadow removal + undo", shadow)
+
+    def rotate():
+        n = card.ops
+        card.imagePage.btnL.click()
+        wait()
+        assert card.base.size == (600, 900), card.base.size
+        card.imagePage.btn180.click()
+        wait()
+        card.imagePage.spin.setValue(10.0)
+        card.imagePage.btnFree.click()
+        wait()
+        assert card.base.size[0] > 600 and card.ops == n + 3
+        for _ in range(3):
+            card.undo_step()
+            wait()
+        assert card.base.size == (900, 600) and card.ops == n
+    step("rotate 90 / 180 / free angle + undo", rotate)
 
     def globals_():
         card.panel.rowSat.sl.setValue(140)
-        card.panel.rowSharp.sl.setValue(50)
-        card.panel.rowDetail.sl.setValue(30)
+        card.texture.rowSharp.sl.setValue(50)
+        card.texture.rowDetail.sl.setValue(30)
         card.panel.rowFeather.sl.setValue(20)
-        card._render_now()
+        card.render_sync()
         assert (card.sat, card.sharp, card.detail, card.feather) == (140, 50, 30, 20)
         assert all(a["feather"] == 20 for a in card.adjs)
         assert not card.canvas.grab().isNull()
-    step("saturation, clarity, feather sliders", globals_)
+    step("saturation, texture, feather sliders", globals_)
 
-    def selection():
+    def selection_ants():
         aid = card.adjs[0]["id"]
         card._set_focus(aid)
-        card._render_now()
+        card.render_sync()
         assert card._focus_adj() is not None and not card.canvas.grab().isNull()
-        card.panel.chkSel.setChecked(False)
-        assert card._focus_adj() is None
-        card.panel.chkSel.setChecked(True)
+        card.btnSelVis.click()
+        assert not card.canvas.sel_visible
+        card.btnSelVis.click()
         card._clear_focus()
-    step("selected part is shown", selection)
+    step("outline of the picked color, selection on/off", selection_ants)
 
-    def zero_fill():
-        for a in card.adjs:
-            a["k"] = 100
-        card.panel.rebuild(card.adjs)
-        red = [a for a in card.adjs if a["type"] == "color"][0]
-        red["k"] = 0
-        card.sat, card.sharp, card.detail = 100, 0, 0
-        out = card._compute()
-        assert out.shape == card.prev.shape
-        card.panel.rebuild(card.adjs)
-    step("color at 0 is filled from surroundings", zero_fill)
+    def selection_tools():
+        H, W = card.prev.shape[:2]
+        card.tools["rect"].click()
+        c = card.canvas
+        QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(200, 150))
+        QTest.mouseMove(c, QPoint(260, 200))
+        QTest.mouseMove(c, QPoint(400, 300))
+        assert not c.grab().isNull()
+        QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(400, 300))
+        assert card.sel is not None
+        cov1 = core.sel_coverage(card.sel)
+        card.modeBtns[1].click()                                   # Add
+        card._on_select("rect", (0.0, 0.0, 60.0, 60.0), "")
+        cov2 = core.sel_coverage(card.sel)
+        assert cov2 > cov1, (cov1, cov2)
+        card.modeBtns[2].click()                                   # Subtract
+        card._on_select("rect", (0.0, 0.0, 60.0, 60.0), "")
+        assert abs(core.sel_coverage(card.sel) - cov1) < 0.01
+        card.modeBtns[0].click()
+        card.tools["lasso"].click()
+        card._on_select("lasso", [(50.0, 300.0), (200.0, 290.0), (210.0, 380.0), (60.0, 390.0)], "")
+        assert card.sel is not None and core.sel_coverage(card.sel) > 0
+        card.select_all()
+        assert core.sel_coverage(card.sel) > 0.99
+        card.deselect()
+        assert card.sel is None
+        card.tools["color"].click()
+        ys, xs = np.where(card.prev.astype(int).sum(2) < 90)
+        card._on_select("color", (int(xs[0]), int(ys[0])), "")
+        wait()
+        assert card.sel is not None and core.sel_coverage(card.sel) > 0
+        card.deselect()
+        card.tools["quick"].click()
+        card._on_select("quick", [(float(xs[0]), float(ys[0])), (float(xs[0]) + 4, float(ys[0]))], "")
+        wait()
+        assert card.sel is not None
+        assert not card.canvas.grab().isNull()
+        card.deselect()
+    step("selection: rectangle, add, subtract, freehand, all, none, color range, quick select", selection_tools)
+
+    def selection_limits_color():
+        arr = card.prev
+        lab = core.rgb_to_lab(arr)
+        r = arr.astype(int)
+        ys, xs = np.where((r[..., 0] > 150) & (r[..., 1] < 80) & (r[..., 2] < 80))
+        pt = (int(xs[0]), int(ys[0]))
+        kind, items, L = core.classify_pick(lab, tuple(int(v) for v in arr[pt[1], pt[0]]))
+        a = items[0]
+        a["k"] = 0
+        sel = np.zeros(arr.shape[:2], np.float32)
+        sel[:, : pt[0] + 1] = 1.0
+        out = core.render(arr, [a], lab=lab, cache={}, sel=sel)
+        free = core.render(arr, [a], lab=lab, cache={})
+        assert np.array_equal(out[:, pt[0] + 40:], arr[:, pt[0] + 40:])        # outside the selection: untouched
+        assert not np.array_equal(free, arr)
+    step("colour edits stay inside the selection", selection_limits_color)
+
+    def move_copy():
+        n = card.ops
+        card.tools["rect"].click()
+        card._on_select("rect", (100.0, 100.0, 250.0, 180.0), "")
+        card.tools["move"].click()
+        card._on_move(60, 40, False)
+        wait()
+        assert card.ops == n + 1
+        card.tools["copy"].click()
+        card._on_move(-30, 100, True)
+        wait()
+        assert card.ops == n + 2 and card.sel is not None
+        QTest.mousePress(card.canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(300, 250))
+        QTest.mouseMove(card.canvas, QPoint(320, 270))
+        assert not card.canvas.grab().isNull()
+        QTest.mouseRelease(card.canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(320, 270))
+        wait()
+        for _ in range(card.ops - n):
+            card.undo_step()
+            wait()
+        assert card.ops == n
+        card.deselect()
+        card._go_move()
+    step("move / copy the selected part + undo", move_copy)
 
     def eraser():
-        card.tools[ImageCanvas.ERASE].click()
+        card.tools["erase"].click()
         assert not card.eraseBar.isHidden()
         n = card.ops
-        card.canvas.eraseFinished.emit("brush", [(100.0, 80.0), (300.0, 80.0)])
-        card.canvas.eraseFinished.emit("rect", (100.0, 150.0, 300.0, 200.0))
-        card.canvas.eraseFinished.emit("ellipse", (320.0, 150.0, 420.0, 220.0))
-        card.canvas.eraseFinished.emit("lasso", [(50.0, 300.0), (200.0, 290.0), (210.0, 380.0), (60.0, 390.0)])
+        for kind, data in (("brush", [(100.0, 80.0), (300.0, 80.0)]), ("rect", (100.0, 150.0, 300.0, 200.0)),
+                           ("ellipse", (320.0, 150.0, 420.0, 220.0)),
+                           ("lasso", [(50.0, 300.0), (200.0, 290.0), (210.0, 380.0), (60.0, 390.0)])):
+            card.canvas.eraseFinished.emit(kind, data)
+            wait()
         assert card.ops == n + 4, (card.ops, n)
         card.canvas.sourcePicked.emit(50.0, 50.0)
         assert card.clone_src is not None
         card.canvas.eraseFinished.emit("brush", [(200.0, 450.0), (260.0, 450.0)])
+        wait()
         assert card.clone_off is not None and card.ops == n + 5
         card._clear_clone()
-        # a real stroke with the mouse
         c = card.canvas
         card.shapeBtns[0].click()
         QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(300, 300))
@@ -206,17 +313,27 @@ def main():
         QTest.mouseMove(c, QPoint(380, 340))
         assert not c.grab().isNull()
         QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(380, 340))
+        wait()
         assert card.ops == n + 6, (card.ops, n)
         card.shapeBtns[1].click()
         QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(200, 200))
         QTest.mouseMove(c, QPoint(260, 250))
         QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(260, 250))
+        wait()
         assert card.ops == n + 7, (card.ops, n)
         for _ in range(7):
             card.undo_step()
+            wait()
         assert card.ops == n
         card._go_move()
     step("eraser: brush, shapes, clone, mouse", eraser)
+
+    def tabs():
+        for i in range(5):
+            card.catBtns[i].click()
+            assert card.side.currentIndex() == i and card.catStack.currentIndex() == i
+        card.catBtns[0].click()
+    step("category tabs", tabs)
 
     def copy_out():
         card.copy_image()
@@ -230,12 +347,17 @@ def main():
 
     def strip_drag():
         md = win._mime_for(card.uid)
-        assert md is not None and md.hasUrls()
+        assert md is not None and md.hasUrls() and os.path.exists(md.urls()[0].toLocalFile())
         assert win.strip.provider is not None
-    step("drag out data", strip_drag)
+        card.prepare_export()                          # background file for drag-out
+        QThreadPool.globalInstance().waitForDone(10000)
+        app.processEvents()
+        assert card.export_ready() is not None
+    step("drag out data (files, background prepared)", strip_drag)
 
     def save_one():
         win.save_card(card)
+        wait()
         files = os.listdir(out)
         assert any(f.startswith("page0_edited") for f in files), files
         assert not card.is_unsaved()
@@ -244,17 +366,35 @@ def main():
     def save_all():
         win.carousel.go_to(1, animate=False)
         c2 = win.carousel.current()
-        c2._auto_shadow()
+        c2.btnShadow.click()
+        wait()
         win.save_all()
+        wait()
         files = os.listdir(out)
         assert any(f.startswith("page1_edited") for f in files), files
     step("save all edited", save_all)
+
+    def pdf():
+        pdf1 = os.path.join(tmp, "one.pdf")
+        pdf_all = os.path.join(tmp, "all.pdf")
+        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (pdf_all, ""))
+        QInputDialog.getItem = staticmethod(lambda *a, **k: (a[3][1], True))
+        win._save_job(card, pdf1)
+        wait()
+        win.save_all_pdf()
+        wait()
+        for p, pages in ((pdf1, 1), (pdf_all, 3)):
+            data = open(p, "rb").read()
+            assert data.startswith(b"%PDF") and data.count(b"/Type /Page ") == pages, (p, data.count(b"/Type /Page "))
+            assert data.rstrip().endswith(b"%%EOF")
+    step("PDF: one picture, all pages in one PDF", pdf)
 
     def apply_all():
         win.carousel.go_to(0, animate=False)
         c0 = win.carousel.current()
         c0.panel.rowSat.sl.setValue(130)
         win.apply_to_all(c0)
+        wait()
         for c in win.carousel.cards:
             if c is not c0:
                 assert c.is_edited()
@@ -265,6 +405,7 @@ def main():
         assert other.sat == 170 and c0.sat == 130
         assert all(c.btnSaveAll.isEnabled() for c in win.carousel.cards)
         win.save_all()
+        wait()
     step("apply to all, then change one picture", apply_all)
 
     def nav():
@@ -278,18 +419,77 @@ def main():
         assert not win.grab().isNull()
     step("slide between pictures", nav)
 
+    def reorder():
+        names = [c.name for c in win.carousel.cards]
+        win.carousel.go_to(0, animate=False)
+        win.move_page(1)
+        assert [c.name for c in win.carousel.cards] == [names[1], names[0], names[2]]
+        assert [win.strip.item(i).data(Qt.ItemDataRole.UserRole) for i in range(3)] == [c.uid for c in win.carousel.cards]
+        assert win.carousel.index == 1
+        win.move_page(-1)
+        assert [c.name for c in win.carousel.cards] == names
+    step("change page order", reorder)
+
+    def phone_test():
+        import io
+        import json
+        import urllib.request
+        from phonedlg import PhoneDialog, qr_pixmap
+        win.open_phone()
+        assert win.phone is not None and win.phone.running()
+        url = "http://127.0.0.1:%d/s/%s" % (win.phone.port, win.phone.token)
+        assert not qr_pixmap("http://192.168.1.5:5000/s/abc/").isNull()
+        assert win._phone_dlg is not None
+
+        def post(path, data):
+            return urllib.request.urlopen(urllib.request.Request(url + path, data=data, method="POST"), timeout=20).read()
+        buf = io.BytesIO()
+        Image.open(paths[0]).save(buf, "JPEG")
+        jpg = buf.getvalue()
+        d = json.loads(post("/api/detect", jpg))
+        assert d["ok"] and len(d["quad"]) == 4
+        q = ",".join("%.1f,%.1f" % tuple(p) for p in d["quad"])
+        assert Image.open(io.BytesIO(post("/api/warp?q=" + q, jpg))).size[0] > 10
+        before = len(win.carousel.cards)
+        import threading
+        t = threading.Thread(target=lambda: [post("/api/upload?kind=scan&batch=t1&i=%d&n=2&name=p.jpg" % i, jpg)
+                                             for i in range(2)])
+        t.start()
+        import time
+        end = time.time() + 15
+        while len(win.carousel.cards) < before + 2 and time.time() < end:
+            app.processEvents()
+            time.sleep(0.02)
+        t.join()
+        assert len(win.carousel.cards) == before + 2, len(win.carousel.cards)
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/s/wrongtoken/" % win.phone.port, timeout=5)
+            assert False, "wrong token accepted"
+        except urllib.error.HTTPError as ex:
+            assert ex.code == 404
+        win._phone_dlg._tick()
+        win._phone_dlg.hide()
+        win.phone.stop()
+        win.phone = None
+        win.clear_all()
+    step("phone: server, detect, warp, 2-page upload, wrong link refused", phone_test)
+
     def remove():
+        win.add_files(paths)
+        wait()
         win.carousel.go_to(2, animate=False)
+        n = len(win.carousel.cards)
         win.remove_card(win.carousel.current())
-        assert len(win.carousel.cards) == 2 and win.strip.count() == 2
+        assert len(win.carousel.cards) == n - 1 and win.strip.count() == n - 1
     step("remove a picture", remove)
 
     def paste():
+        n = len(win.carousel.cards)
         img = QImage(120, 80, QImage.Format.Format_RGB32)
         img.fill(0xFFCCCCCC)
         QApplication.clipboard().setImage(img)
         win.paste()
-        assert len(win.carousel.cards) == 3, len(win.carousel.cards)
+        assert len(win.carousel.cards) == n + 1, len(win.carousel.cards)
     step("paste a copied picture", paste)
 
     def clear():
@@ -311,6 +511,7 @@ def main():
         win.clear_all()
     step("png / webp / bmp, and a whole folder", more_formats)
 
+    wait()
     QThreadPool.globalInstance().waitForDone(5000)
     print("\nALL OK" if not failed else "\nFAILED: " + ", ".join(failed), flush=True)
     sys.exit(1 if failed else 0)

@@ -6,14 +6,17 @@ import time
 from PIL import Image, ImageOps
 from PySide6.QtCore import (QEasingCurve, QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import QAction, QDesktopServices, QFontMetrics, QIcon, QImage, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QListView, QListWidget,
-                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QStackedLayout,
-                               QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtCore import QMimeData
+from PySide6.QtGui import (QAction, QDesktopServices, QDrag, QFontMetrics, QIcon, QImage, QKeySequence, QPixmap,
+                           QShortcut)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+                               QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QPushButton, QStackedLayout, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 import core
 import winutil
 from card import Card
+from jobs import JobRunner
 from theme import logo_pixmap, make_icon
 
 FILTER = "Pictures (%s);;All files (*)" % " ".join("*" + e for e in sorted(core.IMG_EXT))
@@ -57,6 +60,27 @@ class Strip(QListWidget):
     def __init__(self):
         super().__init__()
         self.provider = None
+        self.preparer = None
+        self.setMouseTracking(True)
+        self.itemEntered.connect(lambda it: self.preparer(it.data(Qt.ItemDataRole.UserRole)) if self.preparer else None)
+
+    def startDrag(self, supportedActions):
+        """Always COPY: a move would take the user's original file away."""
+        it = self.currentItem()
+        if it is None or self.provider is None:
+            return
+        try:
+            md = self.provider(it.data(Qt.ItemDataRole.UserRole))
+        except Exception:
+            md = None
+        if md is None:
+            return
+        d = QDrag(self)
+        d.setMimeData(md)
+        ic = it.icon()
+        if not ic.isNull():
+            d.setPixmap(ic.pixmap(96, 96))
+        d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
 
     def mimeData(self, items):
         if self.provider is not None and items:
@@ -114,6 +138,17 @@ class Carousel(QWidget):
 
     def current(self):
         return self.cards[self._idx] if self.cards else None
+
+    def move_card(self, i, j):
+        """Page order: the card at i goes to position j."""
+        if not (0 <= i < len(self.cards) and 0 <= j < len(self.cards)) or i == j:
+            return
+        c = self.cards.pop(i)
+        self.cards.insert(j, c)
+        self._idx = j
+        self._pos = float(j)
+        self._anim.stop()
+        self._layout()
 
     def go_to(self, i, animate=True):
         if not self.cards:
@@ -191,6 +226,10 @@ class MainWindow(QMainWindow):
         self._paste_n = 0
         self.items = {}
         self._sync = False
+        self.runner = JobRunner(self)
+        self.runner.changed.connect(self._job_changed)
+        self.phone = None
+        self._phone_dlg = None
         self.setWindowTitle("Image Fixer")
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
@@ -235,8 +274,16 @@ class MainWindow(QMainWindow):
         self.btnChoose.clicked.connect(self.choose_files)
         self.btnSaveAll = QPushButton("Save all edited")
         self.btnSaveAll.clicked.connect(self.save_all)
+        self.btnPhone = QPushButton("Add from phone")
+        self.btnPhone.setToolTip("Use your phone as a wireless scanner / picture sender (QR code)")
+        self.btnPhone.clicked.connect(self.open_phone)
+        self.btnPdfAll = QPushButton("Save all as PDF")
+        self.btnPdfAll.setToolTip("One PDF with every open picture, one page each")
+        self.btnPdfAll.clicked.connect(self.save_all_pdf)
         l.addWidget(self.btnChoose)
+        l.addWidget(self.btnPhone)
         l.addWidget(self.btnSaveAll)
+        l.addWidget(self.btnPdfAll)
         l.addStretch(1)
         self.btnFolder = QPushButton("Save folder: not set")
         self.btnFolder.setToolTip("Edited pictures are saved here. Click to change.")
@@ -327,6 +374,7 @@ class MainWindow(QMainWindow):
         self.btnNext.clicked.connect(lambda: self.carousel.next())
         self.strip = Strip()
         self.strip.provider = self._mime_for
+        self.strip.preparer = self._prepare_for
         self.strip.setDragEnabled(True)
         self.strip.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
@@ -341,6 +389,17 @@ class MainWindow(QMainWindow):
         self.strip.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.strip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.strip.currentRowChanged.connect(self._strip_changed)
+        self.btnPageL = QPushButton("\u21e0")
+        self.btnPageR = QPushButton("\u21e2")
+        for b, d, tip in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)"),
+                          (self.btnPageR, 1, "Move this page later (page order in the PDF)")):
+            b.setToolTip(tip)
+            b.setProperty("flat", True)
+            b.clicked.connect(lambda _=False, d=d: self.move_page(d))
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(170)
+        self.progress.setTextVisible(False)
+        self.progress.hide()
         self.lblCount = QLabel("")
         self.lblCount.setObjectName("muted")
         self.lblCount.setMinimumWidth(70)
@@ -352,7 +411,10 @@ class MainWindow(QMainWindow):
         b.addWidget(self.btnPrev)
         b.addWidget(self.strip, 1)
         b.addWidget(self.btnNext)
+        b.addWidget(self.btnPageL)
+        b.addWidget(self.btnPageR)
         b.addWidget(self.lblCount)
+        b.addWidget(self.progress)
         b.addWidget(self.lblStatus)
         l.addWidget(bar)
         return w
@@ -398,6 +460,8 @@ class MainWindow(QMainWindow):
         sc("Ctrl+S", lambda: self._with_current(self.save_card))
         sc("Ctrl+Shift+S", self.save_all)
         sc("Ctrl+Z", lambda: self._with_current(lambda c: c.undo_step()))
+        sc("Ctrl+A", lambda: self._with_current(lambda c: c.select_all()))
+        sc("Ctrl+D", lambda: self._with_current(lambda c: c.deselect()))
         sc("Ctrl+0", lambda: self._with_current(lambda c: c.canvas.fit()))
         sc("Ctrl+=", lambda: self._with_current(lambda c: c.canvas.zoom_by(1.25)))
         sc("Ctrl++", lambda: self._with_current(lambda c: c.canvas.zoom_by(1.25)))
@@ -405,8 +469,26 @@ class MainWindow(QMainWindow):
 
     def _with_current(self, fn):
         c = self.carousel.current()
-        if c is not None:
+        if c is not None and not self.runner.busy:
             fn(c)
+
+    def _job_changed(self, busy, frac, text):
+        """A slow job is running: show progress, keep the window alive but lock the pictures."""
+        self.carousel.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        if busy:
+            if frac < 0:
+                self.progress.setRange(0, 0)
+            else:
+                self.progress.setRange(0, 1000)
+                self.progress.setValue(int(frac * 1000))
+            self.lblStatus.setText(text)
+
+    def _busy(self):
+        if self.runner.busy:
+            self.say("Please wait until the current work is finished.")
+            return True
+        return False
 
     # ------------------------------------------------------------ show/hide
     def show_front(self):
@@ -440,6 +522,8 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
         self.quitting = True
+        if self.phone is not None:
+            self.phone.stop()
         self.settings.setValue("geometry", self.saveGeometry())
         if self.tray is not None:
             self.tray.hide()
@@ -522,11 +606,13 @@ class MainWindow(QMainWindow):
 
     def _add_one(self, path):
         c = Card(path)
+        c.runner = self.runner
         c.editedChanged.connect(self._card_edited)
         c.removeRequested.connect(self.remove_card)
         c.saveRequested.connect(self.save_card)
         c.saveAsRequested.connect(self.save_card_as)
         c.saveAllRequested.connect(self.save_all)
+        c.pdfAllRequested.connect(self.save_all_pdf)
         c.applyAllRequested.connect(self.apply_to_all)
         c.message.connect(self.say)
         self.carousel.add_card(c)
@@ -582,6 +668,9 @@ class MainWindow(QMainWindow):
             c.btnSaveAll.setText(label)
             c.btnSaveAll.setEnabled(unsaved > 0)
         self.btnClear.setEnabled(n > 0)
+        self.btnPdfAll.setEnabled(n > 0)
+        self.btnPageL.setEnabled(n > 1 and i > 0)
+        self.btnPageR.setEnabled(n > 1 and i < n - 1)
         if n == 0:
             self.stack.setCurrentIndex(0)
 
@@ -608,18 +697,47 @@ class MainWindow(QMainWindow):
         self.say("Same colors / saturation / clarity given to %d other picture(s). "
                  "From now on a change stays on the picture you change." % len(others))
 
-    def _mime_for(self, uid):
+    def _card(self, uid):
         for c in self.carousel.cards:
             if c.uid == uid:
-                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                try:
-                    return c.make_mime()[0]
-                finally:
-                    QApplication.restoreOverrideCursor()
+                return c
         return None
+
+    def _prepare_for(self, uid):
+        c = self._card(uid)
+        if c is not None and not self.runner.busy:
+            c.prepare_export()
+
+    def _mime_for(self, uid):
+        c = self._card(uid)
+        if c is None:
+            return None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return c.make_mime(with_image=False)[0]      # files only (the file was prepared while hovering)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    # ------------------------------------------------------------ page order
+    def move_page(self, d):
+        if self._busy():
+            return
+        i = self.carousel.index
+        j = i + d
+        if not self.carousel.cards or not (0 <= j < len(self.carousel.cards)):
+            return
+        self.carousel.move_card(i, j)
+        self._sync = True
+        it = self.strip.takeItem(i)
+        self.strip.insertItem(j, it)
+        self._sync = False
+        self._current_changed(j)
+        self.say("Moved to position %d." % (j + 1))
 
     # ----------------------------------------------------------- removing
     def remove_card(self, c):
+        if self._busy():
+            return
         if c.is_unsaved():
             ans = QMessageBox.question(self, "Remove", "This picture has edits that are not saved. Remove it anyway?",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -635,6 +753,8 @@ class MainWindow(QMainWindow):
         self._current_changed(self.carousel.index)
 
     def clear_all(self):
+        if self._busy():
+            return
         n = sum(1 for c in self.carousel.cards if c.is_unsaved())
         if n:
             ans = QMessageBox.question(self, "Clear all", "%d edited picture(s) are not saved. Clear anyway?" % n,
@@ -681,40 +801,48 @@ class MainWindow(QMainWindow):
             return d
         return self.choose_dir() or None
 
-    def _save_to(self, card, path):
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            core.save_image(card.result_image(), path)
-        finally:
-            QApplication.restoreOverrideCursor()
-        card.mark_saved(path)
+    def _fail_box(self, title):
+        return lambda msg: QMessageBox.warning(self, title, "Could not save:\n%s" % msg.splitlines()[0])
+
+    def _save_job(self, card, path):
+        """Render + write in a worker thread (progress bar); PDF is chosen by the file name."""
+        args = card.render_args()
+        mode = self._pdf_mode() if path.lower().endswith(".pdf") else None
+        if path.lower().endswith(".pdf") and mode is None:
+            return
+
+        def work(progress):
+            progress(0.1, "rendering")
+            img = core.render_full(*args)
+            progress(0.7, "writing")
+            if mode is not None:
+                core.save_pdf([img], path, mode)
+            else:
+                core.save_image(img, path)
+            return path
+
+        def done(p):
+            card.mark_saved(p)
+            self.say("Saved: " + p)
+        self.runner.run("Saving " + card.name, work, done, self._fail_box("Save"))
 
     def save_card(self, card):
         d = self._need_dir()
         if not d:
             return
         stem, ext = card.out_name()
-        path = core.unique_path(d, stem, ext)
-        try:
-            self._save_to(card, path)
-            self.say("Saved: " + path)
-        except Exception as ex:
-            QMessageBox.warning(self, "Save", "Could not save:\n%s" % ex)
+        self._save_job(card, core.unique_path(d, stem, ext))
 
     def save_card_as(self, card):
         stem, ext = card.out_name()
         start = os.path.join(self._dir() or os.path.dirname(card.path), stem + ext)
         path, _ = QFileDialog.getSaveFileName(self, "Save as", start,
-                                              "Pictures (*.jpg *.png *.webp *.bmp *.tif);;All files (*)")
+                                              "Pictures (*.jpg *.png *.webp *.bmp *.tif);;PDF document (*.pdf);;All files (*)")
         if not path:
             return
         if not os.path.splitext(path)[1]:
             path += ext
-        try:
-            self._save_to(card, path)
-            self.say("Saved: " + path)
-        except Exception as ex:
-            QMessageBox.warning(self, "Save", "Could not save:\n%s" % ex)
+        self._save_job(card, path)
 
     def save_all(self):
         todo = [c for c in self.carousel.cards if c.is_unsaved()]
@@ -724,19 +852,93 @@ class MainWindow(QMainWindow):
         d = self._need_dir()
         if not d:
             return
-        done, failed = 0, []
-        for i, c in enumerate(todo, 1):
-            self.say("Saving %d / %d ..." % (i, len(todo)))
-            QApplication.processEvents()
+        jobs, used = [], set()
+        for c in todo:
             stem, ext = c.out_name()
-            try:
-                self._save_to(c, core.unique_path(d, stem, ext))
-                done += 1
-            except Exception as ex:
-                failed.append("%s: %s" % (c.name, ex))
-        self.say("Saved %d picture(s) in %s" % (done, d))
-        if failed:
-            QMessageBox.warning(self, "Save all", "Some pictures could not be saved:\n" + "\n".join(failed))
+            p = core.unique_path(d, stem, ext)
+            n = 2
+            while p in used:
+                p = os.path.join(d, "%s (%d)%s" % (stem, n, ext))
+                n += 1
+            used.add(p)
+            jobs.append((c, p, c.render_args()))
+
+        def work(progress):
+            ok, failed = [], []
+            for i, (c, p, args) in enumerate(jobs):
+                progress(i / len(jobs), "%d / %d" % (i + 1, len(jobs)))
+                try:
+                    core.save_image(core.render_full(*args), p)
+                    ok.append((c, p))
+                except Exception as ex:
+                    failed.append("%s: %s" % (c.name, ex))
+            return ok, failed
+
+        def done(r):
+            ok, failed = r
+            for c, p in ok:
+                c.mark_saved(p)
+            self.say("Saved %d picture(s) in %s" % (len(ok), d))
+            if failed:
+                QMessageBox.warning(self, "Save all", "Some pictures could not be saved:\n" + "\n".join(failed))
+        self.runner.run("Saving pictures", work, done, self._fail_box("Save all"))
+
+    def _pdf_mode(self):
+        items = ["Same shape as the picture (nothing cut or padded)", "A4 paper (turned to fit each picture)",
+                 "US Letter paper (turned to fit each picture)"]
+        modes = ["fit", "a4", "letter"]
+        last = self.settings.value("pdf_mode", "fit", type=str)
+        cur = modes.index(last) if last in modes else 0
+        item, ok = QInputDialog.getItem(self, "PDF page size", "Page size:", items, cur, False)
+        if not ok:
+            return None
+        mode = modes[items.index(item)]
+        self.settings.setValue("pdf_mode", mode)
+        return mode
+
+    def save_all_pdf(self):
+        """Every open picture = one page, in thumbnail order."""
+        if self._busy():
+            return
+        cards = list(self.carousel.cards)
+        if not cards:
+            self.say("There is no picture to save.")
+            return
+        start = os.path.join(self._dir() or os.path.expanduser("~"), "Pages.pdf")
+        path, _ = QFileDialog.getSaveFileName(self, "Save all pages as one PDF", start, "PDF document (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        mode = self._pdf_mode()
+        if mode is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            argl = [c.render_args() for c in cards]
+        finally:
+            QApplication.restoreOverrideCursor()
+        sources = [(lambda a=a: core.render_full(*a)) for a in argl]
+
+        def work(progress):
+            core.save_pdf(sources, path, mode, progress=progress)
+            return path
+
+        def done(p):
+            self.say("PDF saved (%d pages): %s" % (len(cards), p))
+        self.runner.run("Making the PDF", work, done, self._fail_box("PDF"))
+
+    # --------------------------------------------------------------- phone
+    def open_phone(self):
+        from phonedlg import PhoneDialog
+        if self._phone_dlg is None:
+            self._phone_dlg = PhoneDialog(self)
+        self._phone_dlg.show_front()
+
+    def phone_received(self, paths):
+        self.show_front()
+        self.add_files(paths)
+        self.say("Received %d picture(s) from the phone." % len(paths))
 
     # ------------------------------------------------------------- settings
     def _toggle_autostart(self, on):

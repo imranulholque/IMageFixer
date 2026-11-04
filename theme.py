@@ -87,6 +87,13 @@ QPushButton[accent="true"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2
 QPushButton[accent="true"]:disabled { background: #2a2f3f; color: #6b7388; }
 QPushButton[danger="true"] { background: #3a1b22; border-color: #5a2630; color: #ffb4bd; }
 QPushButton[danger="true"]:hover { background: #4a222b; }
+QPushButton[tab="true"] { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 7px 16px; font-weight: 600; color: #9aa3b8; }
+QPushButton[tab="true"]:hover { color: white; background: #171c28; }
+QPushButton[tab="true"]:checked { background: transparent; color: white; border-bottom: 2px solid #818cf8; }
+QProgressBar { background: #222836; border: none; border-radius: 4px; height: 8px; text-align: center; }
+QProgressBar::chunk { background: #6366f1; border-radius: 4px; }
+QDoubleSpinBox, QComboBox { background: #1a1f2b; border: 1px solid #30374a; border-radius: 8px; padding: 5px 8px; }
 QPushButton[flat="true"] { background: transparent; border: none; padding: 4px 8px; color: #9aa3b8; }
 QPushButton[flat="true"]:hover { color: white; background: #1f2535; }
 QPushButton#nav { font-size: 20px; padding: 2px 12px; }
