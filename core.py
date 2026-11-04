@@ -567,33 +567,86 @@ def estimate_paper(small, progress=None):
     return np.maximum(bg, 40.0)
 
 
+def _sliding_max(a, k, axis):
+    """Maximum over a window of k pixels along one axis (doubling trick: only log2(k) passes)."""
+    out = a
+    span = 1
+    while span * 2 <= k:
+        sh = np.roll(out, -span, axis=axis)
+        # roll wraps around: put the edge values back instead of the wrapped ones
+        idx = [slice(None)] * a.ndim
+        idx[axis] = slice(-span, None)
+        sh[tuple(idx)] = out[tuple(idx)]
+        out = np.maximum(out, sh)
+        span *= 2
+    if span < k:
+        sh = np.roll(out, -(k - span), axis=axis)
+        idx = [slice(None)] * a.ndim
+        idx[axis] = slice(-(k - span), None)
+        sh[tuple(idx)] = out[tuple(idx)]
+        out = np.maximum(out, sh)
+    return out
+
+
+def _centered_max(a, k):
+    """max filter, window k (odd), both axes, centred."""
+    h = k // 2
+    p = np.pad(a, ((h, h), (h, h)) + ((0, 0),) * (a.ndim - 2), mode="edge")
+    p = _sliding_max(_sliding_max(p, k, 0), k, 1)
+    return p[:a.shape[0], :a.shape[1]] if h == 0 else p[h - h:h - h + a.shape[0], h - h:h - h + a.shape[1]]
+
+
+def paper_light(small, progress=None):
+    """Brightness of the blank paper everywhere (float32 h,w,3) - soft AND hard-edged shadows (window blinds, a hand).
+    Method: 'closing' of the picture: the lightest value in a window wider than any pen stroke removes the writing,
+    shrinking it back again keeps shadow edges exactly where they are."""
+    h, w = small.shape[:2]
+    a = small.astype(np.float32)
+    k = int(max(9, round(max(h, w) * 0.022))) | 1
+    sm = np.stack([np.asarray(Image.fromarray(small[..., c]).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
+                   for c in range(3)], -1)
+    mx = np.stack([_centered_max(sm[..., c], k) for c in range(3)], -1)
+    if progress:
+        progress(0.4, "Measuring the light")
+    neg = 255.0 - mx
+    bg = 255.0 - np.stack([_centered_max(neg[..., c], k) for c in range(3)], -1)   # erosion = min
+    # the lightest value over-estimates a little (noise): take the typical paper level of the neighbourhood
+    bg = np.stack([np.asarray(Image.fromarray(np.clip(bg[..., c] + 0.5, 0, 255).astype(np.uint8)).filter(
+        ImageFilter.GaussianBlur(max(1.0, k / 6.0))), dtype=np.float32) for c in range(3)], -1)
+    return np.maximum(bg * 0.985, 30.0)
+
+
 def remove_shadow(img, strength=1.0, progress=None):
-    """Evens out paper lighting (shadows, uneven light) and whitens the page; text, stamps and shapes stay.
-    strength 0..1 blends between the original and the fully corrected result."""
+    """'Scan' look: shadows and grey paper become white, writing / lines / shapes stay and get clearer.
+    strength 0..1: how far the paper is pushed to white and the ink darkened."""
     arr = np.asarray(img)
     H, W = arr.shape[:2]
-    ws = 1100.0 / max(H, W)
-    if ws < 1.0:
-        small = np.asarray(img.resize((max(8, round(W * ws)), max(8, round(H * ws))), Image.Resampling.BOX))
-    else:
-        small = arr
+    ws = 1400.0 / max(H, W)
+    small = np.asarray(img.resize((max(8, round(W * ws)), max(8, round(H * ws))), Image.Resampling.BOX)) \
+        if ws < 1.0 else arr
     if progress:
-        progress(0.1, "Measuring the lighting")
-    bg = estimate_paper(small, progress)
-    gain = 255.0 / bg
+        progress(0.1, "Measuring the light")
+    bg = paper_light(small, progress)
     s = float(max(0.0, min(1.0, strength)))
-    gain = np.clip(1.0 + (gain - 1.0) * s, 0.5, 4.0).astype(np.float32)
+    gain = np.clip(255.0 / bg, 1.0, 6.0).astype(np.float32)
     gh, gw = gain.shape[:2]
+    # white point: everything lighter than this becomes pure white; black point: darkest ink stays dark
+    lum_small = small.astype(np.float32).mean(2) * 255.0 / np.maximum(bg.mean(2), 1.0)
+    bp = float(np.clip(np.percentile(lum_small, 0.5), 0, 90))
+    wp = 250.0 - 38.0 * s
+    gam = 1.0 + 0.35 * s
     out = np.empty_like(arr)
     step = 600
     for y0 in range(0, H, step):
         y1 = min(H, y0 + step)
         box = (0.0, y0 * gh / H, float(gw), y1 * gh / H)
         g = np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(gain[..., c])).resize(
-            (W, y1 - y0), Image.Resampling.BICUBIC, box=box), dtype=np.float32) for c in range(3)], -1)
-        out[y0:y1] = np.clip(arr[y0:y1].astype(np.float32) * g + 0.5, 0, 255).astype(np.uint8)
+            (W, y1 - y0), Image.Resampling.BILINEAR, box=box), dtype=np.float32) for c in range(3)], -1)
+        x = np.minimum(arr[y0:y1].astype(np.float32) * g, 255.0)
+        x = np.clip((x - bp) / max(1.0, wp - bp), 0.0, 1.0) ** gam
+        out[y0:y1] = np.clip(x * 255.0 + 0.5, 0, 255).astype(np.uint8)
         if progress:
-            progress(0.7 + 0.3 * y1 / H, "Applying")
+            progress(0.6 + 0.4 * y1 / H, "Applying")
     return Image.fromarray(out)
 
 

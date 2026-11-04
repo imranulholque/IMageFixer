@@ -233,7 +233,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Image Fixer")
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
-        self.setMinimumSize(1240, 700)
+        self.setMinimumSize(1100, 680)
 
         central = QWidget()
         central.setObjectName("root")
@@ -282,8 +282,6 @@ class MainWindow(QMainWindow):
         self.btnPdfAll.clicked.connect(self.save_all_pdf)
         l.addWidget(self.btnChoose)
         l.addWidget(self.btnPhone)
-        l.addWidget(self.btnSaveAll)
-        l.addWidget(self.btnPdfAll)
         l.addStretch(1)
         self.btnFolder = QPushButton("Save folder: not set")
         self.btnFolder.setToolTip("Edited pictures are saved here. Click to change.")

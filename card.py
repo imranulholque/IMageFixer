@@ -21,37 +21,29 @@ EXPORT_DIR = os.path.join(tempfile.gettempdir(), "imagefixer_export")
 # tool key -> (canvas mode, shape)
 TOOL_MODE = {
     "view": (ImageCanvas.VIEW, None), "pick": (ImageCanvas.PICK, None),
-    "quick": (ImageCanvas.SELECT, "quick"), "rect": (ImageCanvas.SELECT, "rect"),
-    "lasso": (ImageCanvas.SELECT, "lasso"), "color": (ImageCanvas.SELECT, "color"),
+    "quick": (ImageCanvas.SELECT, "quick"), "brush": (ImageCanvas.SELECT, "brush"),
+    "rect": (ImageCanvas.SELECT, "rect"), "lasso": (ImageCanvas.SELECT, "lasso"),
     "move": (ImageCanvas.MOVESEL, None), "copy": (ImageCanvas.MOVESEL, None),
     "crop": (ImageCanvas.CROP, None), "persp": (ImageCanvas.PERSP, None), "erase": (ImageCanvas.ERASE, None),
 }
 HINTS = {
     "view": "Drag to move the picture  -  Ctrl + mouse wheel to zoom",
-    "pick": "Click any color in the picture (text, ink, stamp, shadow) - it appears on the right. "
-            "Point at a color row to see which part of the picture it selects.",
-    "quick": "Brush over an object: the selection grows to its edges.  Shift + drag = add,  Alt + drag = subtract.",
-    "rect": "Drag a rectangle.  Shift + drag = add,  Alt + drag = subtract.",
-    "lasso": "Draw around an area (it closes when you let go).  Shift = add,  Alt = subtract.",
-    "color": "Click a color: every place with that color is selected (Tolerance on the right).  Shift = add,  Alt = subtract.",
+    "pick": "Click a color in the picture (ink, stamp, text) - its slider appears on the right.",
+    "quick": "Brush over an object: the selection grows to its edges. Wrong spot? press Subtract and brush over it, or Ctrl+Z.",
+    "brush": "Paint the area you want to select. Press Subtract to paint parts away again, or Ctrl+Z.",
+    "rect": "Drag a rectangle to select it.",
+    "lasso": "Draw around an area (it closes when you let go).",
     "move": "Drag the selected part to another place. The old place is filled from its surroundings.",
     "copy": "Drag the selected part: a copy is placed there, the original stays.",
     "crop": "Drag the box or its handles, then press Apply (Enter)",
     "persp": "Drag the 4 corner points onto the 4 corners of the page, then press Apply (Enter)",
     "erase": "Paint / draw over what you want to remove - it is filled with what surrounds it.  "
-             "Alt + click = copy from that spot instead (like the clone tool).",
+             "Alt + click = copy from that spot instead.",
 }
-PANEL_HINT = ("Choose  Eyedropper  on the left, then click on the picture.\n\n"
-              "Click on a colored ink or stamp: one slider for that color and its shades.\n"
-              "Click on black or gray text/shadow: a slider for that shade "
-              "(click another shade to add it).\n\n"
-              "Lower than 100%: that color fades into the paper around it.\n"
-              "Higher than 100%: colors get stronger, black gets darker.\n\n"
-              "To change only a part of a stamp or page, first make a selection (Selection tab).")
+PANEL_HINT = ("Choose  Eyedropper  above, then click a color in the picture.\n"
+              "Lower than 100%: that color fades into the paper.  Higher: stronger and darker.\n"
+              "To change only part of the picture, select that part first.")
 SHAPES = ["brush", "rect", "ellipse", "lasso"]
-CATEGORIES = ["Color", "Selection", "Texture", "Shadow", "Image"]
-CAT_TOOLS = {0: ("pick",), 1: ("quick", "rect", "lasso", "color", "move", "copy"), 2: (), 3: (),
-             4: ("crop", "persp", "erase")}
 
 
 class NoWheelSlider(QSlider):
@@ -240,40 +232,6 @@ class AdjRow(QFrame):
         self.style().polish(self)
 
 
-class SidePage(QWidget):
-    """A right-hand panel: title + content. One page per category."""
-
-    def __init__(self, title):
-        super().__init__()
-        self.setObjectName("panel")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.v = QVBoxLayout(self)
-        self.v.setContentsMargins(14, 14, 14, 14)
-        self.v.setSpacing(12)
-        t = QLabel(title)
-        t.setObjectName("title")
-        self.v.addWidget(t)
-
-    def group(self):
-        g = QFrame()
-        g.setObjectName("group")
-        gl = QVBoxLayout(g)
-        gl.setContentsMargins(12, 12, 12, 12)
-        gl.setSpacing(12)
-        self.v.addWidget(g)
-        return gl
-
-    def note(self, text):
-        lab = QLabel(text)
-        lab.setObjectName("hint")
-        lab.setWordWrap(True)
-        self.v.addWidget(lab)
-        return lab
-
-    def done(self):
-        self.v.addStretch(1)
-
-
 class ColorPanel(QWidget):
     changed = Signal()
     removeAdj = Signal(str)
@@ -283,6 +241,8 @@ class ColorPanel(QWidget):
     deactivated = Signal()
     satChanged = Signal(int)
     featherChanged = Signal(int)
+    sharpChanged = Signal(int)
+    detailChanged = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -293,9 +253,9 @@ class ColorPanel(QWidget):
         v.setContentsMargins(14, 14, 10, 14)
         v.setSpacing(10)
         head = QHBoxLayout()
-        t = QLabel("Color")
+        t = QLabel("Clean & color")
         t.setObjectName("title")
-        self.btnClear = QPushButton("Clear all colors")
+        self.btnClear = QPushButton("Clear colors")
         self.btnClear.setProperty("flat", True)
         self.btnClear.clicked.connect(self.clearAll.emit)
         head.addWidget(t)
@@ -310,12 +270,35 @@ class ColorPanel(QWidget):
         self.lay.setContentsMargins(0, 0, 6, 0)
         self.lay.setSpacing(10)
 
+        self.cleanBox = QFrame()
+        self.cleanBox.setObjectName("group")
+        cl = QVBoxLayout(self.cleanBox)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(12)
+        ct = QLabel("Clean page")
+        ct.setObjectName("sub")
+        self.btnClean = QPushButton("Clean: remove shadow && grey background")
+        self.btnClean.setProperty("accent", True)
+        self.btnClean.setMinimumHeight(38)
+        self.btnClean.setToolTip("Turns shadows and grey paper white, like a good scanner. Text and lines stay.\n"
+                                 "Not happy? Undo, lower the strength and try again.")
+        self.rowStrength = SliderRow("Strength", 0, 100, 100, ("light", "", "full"),
+                                     "How white the paper becomes and how dark the writing gets.")
+        self.rowSharp = SliderRow("Text & line sharpness", 0, 100, 0, ("off", "", "max"),
+                                  "Makes text, lines and shapes sharper. Shapes are never moved or bent.")
+        self.rowDetail = SliderRow("Faint strokes", 0, 100, 0, ("off", "", "max"),
+                                   "Makes faint writing and thin lines clearer.")
+        for w in (ct, self.btnClean, self.rowStrength, self.rowSharp, self.rowDetail):
+            cl.addWidget(w)
+        self.rowSharp.changed.connect(self.sharpChanged.emit)
+        self.rowDetail.changed.connect(self.detailChanged.emit)
+
         self.adjust = QFrame()
         self.adjust.setObjectName("group")
         al = QVBoxLayout(self.adjust)
         al.setContentsMargins(12, 12, 12, 12)
         al.setSpacing(12)
-        self.rowSat = SliderRow("Saturation (whole picture)", 0, 200, 100, ("whiter", "original", "more vivid"),
+        self.rowSat = SliderRow("Saturation", 0, 200, 100, ("whiter", "original", "more vivid"),
                                 "Up: colors get stronger, white and gray never change.\n"
                                 "Down: colors get lighter and lighter, up to white.")
         al.addWidget(self.rowSat)
@@ -336,6 +319,7 @@ class ColorPanel(QWidget):
         fl.addWidget(self.rowFeather)
         self.rowFeather.changed.connect(self.featherChanged.emit)
 
+        self.lay.addWidget(self.cleanBox)
         self.lay.addWidget(self.adjust)
         self.lay.addWidget(self.hint)
         self.lay.addWidget(self.featherBox)
@@ -351,7 +335,7 @@ class ColorPanel(QWidget):
     def _refresh(self):
         empty = not self._rows and self._group is None
         self.hint.setVisible(empty)
-        self.featherBox.setVisible(not empty)
+        self.featherBox.setVisible(False)             # feather stays at 0 (kept for old settings)
         self.btnClear.setVisible(not empty)
 
     def _insert(self, w):
@@ -363,6 +347,10 @@ class ColorPanel(QWidget):
     def set_globals(self, sat, feather):
         self.rowSat.set_value(sat)
         self.rowFeather.set_value(feather)
+
+    def set_clarity(self, sharp, detail):
+        self.rowSharp.set_value(sharp)
+        self.rowDetail.set_value(detail)
 
     def _wire(self, row):
         row.changed.connect(self.changed.emit)
@@ -488,120 +476,6 @@ class ColorPanel(QWidget):
         self._refresh()
 
 
-class SelectionPage(SidePage):
-    brushChanged = Signal(int)
-    tolChanged = Signal(int)
-
-    def __init__(self):
-        super().__init__("Selection")
-        g = self.group()
-        self.lblInfo = QLabel("")
-        self.lblInfo.setObjectName("sub")
-        self.lblInfo.setWordWrap(True)
-        g.addWidget(self.lblInfo)
-        self.rowBrush = SliderRow("Quick select brush", 2, 400, 30, ("small", "", "large"),
-                                  "Size of the brush for the Quick select tool.", unit=" px")
-        self.rowTol = SliderRow("Tolerance", 5, 80, 28, ("exact", "", "wide"),
-                                "How different a color may be to still count as the same object / color.\n"
-                                "Used by Quick select and Color range.", unit="")
-        g.addWidget(self.rowBrush)
-        g.addWidget(self.rowTol)
-        self.rowBrush.changed.connect(self.brushChanged.emit)
-        self.rowTol.changed.connect(self.tolChanged.emit)
-        self.note("New / Add / Subtract (top bar) decide how a new shape joins the selection. "
-                  "Shift + drag also adds, Alt + drag subtracts.\n\n"
-                  "While something is selected, color changes act only inside it. "
-                  "Use Move / Copy to take the selected part to another place.")
-        self.done()
-
-    def show_coverage(self, cov):
-        if cov <= 0:
-            self.lblInfo.setText("Nothing selected - color changes act on the whole picture.")
-        else:
-            self.lblInfo.setText("Selected: %.1f%% of the picture. Color changes act only inside it." % (cov * 100))
-
-
-class TexturePage(SidePage):
-    sharpChanged = Signal(int)
-    detailChanged = Signal(int)
-
-    def __init__(self):
-        super().__init__("Texture")
-        g = self.group()
-        self.rowSharp = SliderRow("Text & line sharpness", 0, 100, 0, ("off", "", "max"),
-                                  "Makes text, lines and shapes sharper. Works for any language and handwriting; "
-                                  "shapes are never moved or bent.")
-        self.rowDetail = SliderRow("Texture & faint strokes", 0, 100, 0, ("off", "", "max"),
-                                   "Makes faint writing, thin lines and texture clearer.")
-        g.addWidget(self.rowSharp)
-        g.addWidget(self.rowDetail)
-        self.rowSharp.changed.connect(self.sharpChanged.emit)
-        self.rowDetail.changed.connect(self.detailChanged.emit)
-        self.note("Sharpness works on edges only. Texture raises faint writing and fine paper detail. "
-                  "Both are applied to the whole picture.")
-        self.done()
-
-    def set_values(self, sharp, detail):
-        self.rowSharp.set_value(sharp)
-        self.rowDetail.set_value(detail)
-
-
-class ShadowPage(SidePage):
-    def __init__(self):
-        super().__init__("Shadow")
-        g = self.group()
-        self.btnShadow = QPushButton("Remove shadows")
-        self.btnShadow.setProperty("accent", True)
-        self.btnShadow.setMinimumHeight(36)
-        self.btnShadow.setToolTip("Evens out the paper lighting and removes soft shadows in one click")
-        self.rowStrength = SliderRow("Strength", 0, 100, 100, ("light", "", "full"),
-                                     "How much of the lighting is corrected.")
-        g.addWidget(self.btnShadow)
-        g.addWidget(self.rowStrength)
-        self.note("The lighting of the paper is measured with text, stamps and their edges left out, then "
-                  "evened out - so letters and shapes keep their exact edges.\n\nNot happy? Undo, lower the "
-                  "strength and try again.")
-        self.done()
-
-
-class ImagePage(SidePage):
-    rotateRequested = Signal(float)       # degrees counter-clockwise
-
-    def __init__(self):
-        super().__init__("Image")
-        g = self.group()
-        lab = QLabel("Rotate")
-        lab.setObjectName("sub")
-        g.addWidget(lab)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self.btnL = QPushButton("↺  90° left")
-        self.btnR = QPushButton("↻  90° right")
-        self.btn180 = QPushButton("180°")
-        for b in (self.btnL, self.btnR, self.btn180):
-            row.addWidget(b)
-        g.addLayout(row)
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        self.spin = QDoubleSpinBox()
-        self.spin.setRange(-180.0, 180.0)
-        self.spin.setDecimals(1)
-        self.spin.setSingleStep(0.5)
-        self.spin.setSuffix(" °")
-        self.spin.setValue(0.0)
-        self.spin.setToolTip("Free angle. Positive = turn to the right (clockwise).")
-        self.btnFree = QPushButton("Rotate by this angle")
-        row2.addWidget(self.spin, 1)
-        row2.addWidget(self.btnFree, 1)
-        g.addLayout(row2)
-        self.btnL.clicked.connect(lambda: self.rotateRequested.emit(90.0))
-        self.btnR.clicked.connect(lambda: self.rotateRequested.emit(-90.0))
-        self.btn180.clicked.connect(lambda: self.rotateRequested.emit(180.0))
-        self.btnFree.clicked.connect(lambda: self.rotateRequested.emit(-self.spin.value()))
-        self.note("Crop, Perspective crop (straightens a photographed page) and Eraser are in the top bar.")
-        self.done()
-
-
 class DragHandle(QPushButton):
     """Press and drag from here: the picture (with your edits) goes to Explorer, WhatsApp Web, Paint ..."""
 
@@ -662,7 +536,7 @@ class Card(QWidget):
         self.detail = 0
         self.feather = 0
         self.sel = None                            # selection mask at preview size (or None)
-        self.sel_mode = "new"
+        self.sel_mode = "add"
         self._sel_ver = 0
         self.undo = []
         self.ops = 0
@@ -733,28 +607,92 @@ class Card(QWidget):
             r1.addWidget(b)
         root.addLayout(r1)
 
-        # row 2: category tabs | selection on/off | zoom
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.tools = {}
+        self.keys = []
+
+        def label(text):
+            lab = QLabel(text)
+            lab.setObjectName("muted")
+            lab.setMinimumWidth(46)
+            return lab
+
+        def sep():
+            f = QFrame()
+            f.setFrameShape(QFrame.Shape.VLine)
+            f.setStyleSheet("color: #2a3042;")
+            return f
+
+        # row 2: selecting
         r2 = QHBoxLayout()
         r2.setSpacing(6)
-        self.catGroup = QButtonGroup(self)
-        self.catGroup.setExclusive(True)
-        self.catBtns = []
-        for i, text in enumerate(CATEGORIES):
+        r2.addWidget(label("Select"))
+        self.btnHand = self._tool_button("view", "Pan", "Drag the picture around")
+        self.btnHand.setChecked(True)
+        r2.addWidget(self.btnHand)
+        r2.addWidget(sep())
+        for key, text, tip in (("quick", "Quick select", "Brush over an object - it is selected up to its edges"),
+                               ("brush", "Brush", "Paint the area to select"),
+                               ("rect", "Box", "Select a rectangle"),
+                               ("lasso", "Freehand", "Draw around an irregular area")):
+            r2.addWidget(self._tool_button(key, text, tip))
+        r2.addWidget(sep())
+        self.modeGroup = QButtonGroup(self)
+        self.modeGroup.setExclusive(True)
+        self.modeBtns = []
+        for i, (text, tip) in enumerate((("Add", "New shapes are added to the selection"),
+                                         ("Subtract", "New shapes are taken OUT of the selection (fix a mistake)"))):
             b = QPushButton(text)
             b.setCheckable(True)
-            b.setProperty("tab", True)
-            self.catGroup.addButton(b, i)
-            self.catBtns.append(b)
+            b.setToolTip(tip)
+            self.modeGroup.addButton(b, i)
+            self.modeBtns.append(b)
             r2.addWidget(b)
-        self.catBtns[0].setChecked(True)
-        r2.addSpacing(14)
-        self.btnSelVis = QPushButton("Selection: on")
+        self.modeBtns[0].setChecked(True)
+        self.btnSelAll = QPushButton("All")
+        self.btnSelAll.setToolTip("Select the whole picture (Ctrl+A)")
+        self.btnDeselect = QPushButton("None")
+        self.btnDeselect.setToolTip("Remove the selection (Ctrl+D)")
+        r2.addWidget(self.btnSelAll)
+        r2.addWidget(self.btnDeselect)
+        r2.addWidget(sep())
+        r2.addWidget(self._tool_button("move", "Move", "Drag the selected part to another place"))
+        r2.addWidget(self._tool_button("copy", "Copy", "Drag a copy of the selected part (original stays)"))
+        r2.addStretch(1)
+        self.btnSelVis = QPushButton("Outline: on")
         self.btnSelVis.setCheckable(True)
         self.btnSelVis.setChecked(True)
-        self.btnSelVis.setToolTip("Show / hide the moving dashed outline of the selection (marching ants)")
+        self.btnSelVis.setToolTip("Show / hide the moving dashed outline of the selection")
         r2.addWidget(self.btnSelVis)
-        r2.addStretch(1)
-        self.btnZoomOut = QPushButton("−")
+        root.addLayout(r2)
+
+        # row 3: editing
+        r3 = QHBoxLayout()
+        r3.setSpacing(6)
+        r3.addWidget(label("Edit"))
+        for key, text, tip in (("pick", "Eyedropper", "Click a color or a black / gray shade to change it"),
+                               ("erase", "Erase", "Erase with a brush or a shape; the place is filled with what "
+                                                  "surrounds it"),
+                               ("crop", "Crop", "Rectangle crop"),
+                               ("persp", "Straighten", "4-point crop: straightens a photographed page")):
+            r3.addWidget(self._tool_button(key, text, tip))
+        self.btnApply = QPushButton("Apply")
+        self.btnApply.setProperty("accent", True)
+        self.btnCancel = QPushButton("Cancel")
+        r3.addWidget(self.btnApply)
+        r3.addWidget(self.btnCancel)
+        self.btnApply.hide()
+        self.btnCancel.hide()
+        r3.addWidget(sep())
+        self.btnRotL = QPushButton("\u21ba Left")
+        self.btnRotL.setToolTip("Rotate 90\u00b0 to the left")
+        self.btnRotR = QPushButton("Right \u21bb")
+        self.btnRotR.setToolTip("Rotate 90\u00b0 to the right")
+        r3.addWidget(self.btnRotL)
+        r3.addWidget(self.btnRotR)
+        r3.addStretch(1)
+        self.btnZoomOut = QPushButton("\u2212")
         self.lblZoom = QLabel("100%")
         self.lblZoom.setMinimumWidth(48)
         self.lblZoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -764,116 +702,18 @@ class Card(QWidget):
         for b in (self.btnZoomOut, self.btnZoomIn):
             b.setFixedWidth(36)
         for w in (self.btnZoomOut, self.lblZoom, self.btnZoomIn, self.btnFit, self.btn100):
-            r2.addWidget(w)
-        root.addLayout(r2)
-
-        # row 3: tools of the chosen category
-        r3 = QHBoxLayout()
-        r3.setSpacing(8)
-        self.group = QButtonGroup(self)
-        self.group.setExclusive(True)
-        self.tools = {}
-        self.keys = []
-        self.btnHand = self._tool_button("view", "Pan", "Drag the picture around")
-        self.btnHand.setChecked(True)
-        r3.addWidget(self.btnHand)
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color: #2a3042;")
-        r3.addWidget(sep)
-        self.catStack = QStackedWidget()
-        self.catStack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.catStack.setFixedHeight(38)
-        r3.addWidget(self.catStack, 1)
+            r3.addWidget(w)
         root.addLayout(r3)
 
-        def page(widgets):
-            w = QWidget()
-            h = QHBoxLayout(w)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(8)
-            for x in widgets:
-                if isinstance(x, str):
-                    lab = QLabel(x)
-                    lab.setObjectName("hint")
-                    h.addWidget(lab)
-                elif x is None:
-                    s = QFrame()
-                    s.setFrameShape(QFrame.Shape.VLine)
-                    s.setStyleSheet("color: #2a3042;")
-                    h.addWidget(s)
-                else:
-                    h.addWidget(x)
-            h.addStretch(1)
-            self.catStack.addWidget(w)
-            return w
-
-        # Color
-        page([self._tool_button("pick", "Eyedropper", "Click a color or a black / gray shade to change it")])
-        # Selection
-        self.modeGroup = QButtonGroup(self)
-        self.modeGroup.setExclusive(True)
-        self.modeBtns = []
-        for i, (text, tip) in enumerate((("New", "A new shape replaces the selection"),
-                                         ("Add", "A new shape is added to the selection"),
-                                         ("Subtract", "A new shape is taken out of the selection"))):
-            b = QPushButton(text)
-            b.setCheckable(True)
-            b.setToolTip(tip)
-            self.modeGroup.addButton(b, i)
-            self.modeBtns.append(b)
-        self.modeBtns[0].setChecked(True)
-        self.btnSelAll = QPushButton("Select all")
-        self.btnDeselect = QPushButton("Deselect")
-        page([self._tool_button("quick", "Quick select", "Brush over an object - it is selected up to its edges"),
-              self._tool_button("rect", "Rectangle", "Select a rectangle"),
-              self._tool_button("lasso", "Freehand", "Draw around an irregular area"),
-              self._tool_button("color", "Color range", "Click a color: all places with that color are selected"),
-              None] + self.modeBtns + [None, self.btnSelAll, self.btnDeselect, None,
-              self._tool_button("move", "Move selected", "Drag the selected part to another place"),
-              self._tool_button("copy", "Copy selected", "Drag a copy of the selected part (original stays)")])
-        page(["Use the sliders on the right."])
-        page(["Use the button on the right."])
-        self.btnApply = QPushButton("Apply")
-        self.btnApply.setProperty("accent", True)
-        self.btnCancel = QPushButton("Cancel")
-        page([self._tool_button("crop", "Crop", "Normal rectangle crop"),
-              self._tool_button("persp", "Perspective crop", "4-point crop that straightens the page"),
-              self._tool_button("erase", "Eraser", "Erase with a brush or a shape; the place is filled with its "
-                                                   "surroundings (Alt + click = clone)"),
-              None, self.btnApply, self.btnCancel])
-        self.btnApply.hide()
-        self.btnCancel.hide()
-
-        # row 4: save / share
-        r4 = QHBoxLayout()
-        r4.setSpacing(8)
-        self.btnSave = QPushButton("Save")
-        self.btnSave.setProperty("accent", True)
-        self.btnSaveAs = QPushButton("Save as...")
-        self.btnSaveAll = QPushButton("Save all edited")
-        self.btnSaveAll.setToolTip("Saves every edited picture into the save folder")
-        self.btnPdfAll = QPushButton("All pages as PDF")
-        self.btnPdfAll.setToolTip("One PDF with every open picture, one page each, in the order of the thumbnails")
-        self.btnApplyAll = QPushButton("Apply to all pictures")
-        self.btnApplyAll.setToolTip("Gives every picture the same color / saturation / texture settings as this one.\n"
-                                    "Changes you make afterwards stay on the picture you change.")
-        self.btnCopy = QPushButton("Copy")
-        self.btnCopy.setToolTip("Copy this picture (with your edits) - then paste it anywhere (Ctrl+C)")
-        self.btnDrag = DragHandle(self)
-        for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll):
-            r4.addWidget(w)
-        r4.addStretch(1)
-        for w in (self.btnApplyAll, self.btnCopy, self.btnDrag):
-            r4.addWidget(w)
-        root.addLayout(r4)
-
-        # eraser options (only while the Eraser is chosen)
+        # options of the chosen tool (size, tolerance, eraser shape)
         self.eraseBar = QWidget()
         eb = QHBoxLayout(self.eraseBar)
         eb.setContentsMargins(0, 0, 0, 0)
         eb.setSpacing(8)
-        eb.addWidget(QLabel("Eraser:"))
+        self.shapeWidget = QWidget()
+        sh = QHBoxLayout(self.shapeWidget)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(8)
         self.shapeGroup = QButtonGroup(self)
         self.shapeGroup.setExclusive(True)
         self.shapeBtns = []
@@ -882,9 +722,10 @@ class Card(QWidget):
             b.setCheckable(True)
             self.shapeGroup.addButton(b, i)
             self.shapeBtns.append(b)
-            eb.addWidget(b)
+            sh.addWidget(b)
         self.shapeBtns[0].setChecked(True)
-        eb.addSpacing(12)
+        eb.addWidget(self.shapeWidget)
+        eb.addSpacing(8)
         eb.addWidget(QLabel("Size"))
         self.sizeSlider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.sizeSlider.setRange(2, 600)
@@ -893,11 +734,24 @@ class Card(QWidget):
         self.sizeSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.lblSize = QLabel("30 px")
         self.lblSize.setMinimumWidth(52)
+        self.tolWidget = QWidget()
+        tw = QHBoxLayout(self.tolWidget)
+        tw.setContentsMargins(0, 0, 0, 0)
+        tw.setSpacing(8)
+        tw.addWidget(QLabel("Tolerance"))
+        self.tolSlider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.tolSlider.setRange(5, 80)
+        self.tolSlider.setValue(28)
+        self.tolSlider.setFixedWidth(140)
+        self.tolSlider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tolSlider.setToolTip("How different a color may be to still count as the same object")
+        tw.addWidget(self.tolSlider)
         self.btnClone = QPushButton("Clear copy spot")
         self.btnClone.setToolTip("Go back to filling from the surroundings")
         self.btnClone.hide()
         eb.addWidget(self.sizeSlider)
         eb.addWidget(self.lblSize)
+        eb.addWidget(self.tolWidget)
         eb.addWidget(self.btnClone)
         eb.addStretch(1)
         root.addWidget(self.eraseBar)
@@ -912,23 +766,37 @@ class Card(QWidget):
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.panel = ColorPanel()
-        self.selPage = SelectionPage()
-        self.texture = TexturePage()
-        self.shadowPage = ShadowPage()
-        self.imagePage = ImagePage()
-        self.side = QStackedWidget()
-        self.side.setFixedWidth(360)
-        for p in (self.panel, self.selPage, self.texture, self.shadowPage, self.imagePage):
-            self.side.addWidget(p)
+        self.panel.setFixedWidth(330)
         body.addWidget(self.canvas, 1)
-        body.addWidget(self.side)
+        body.addWidget(self.panel)
         root.addLayout(body, 1)
-        self.btnShadow = self.shadowPage.btnShadow
-        self.selPage.show_coverage(0)
+        self.btnShadow = self.panel.btnClean
 
-        self.catGroup.idClicked.connect(self._set_category)
+        # row 4: save / share
+        r4 = QHBoxLayout()
+        r4.setSpacing(8)
+        self.btnSave = QPushButton("Save")
+        self.btnSave.setProperty("accent", True)
+        self.btnSaveAs = QPushButton("Save as...")
+        self.btnSaveAll = QPushButton("Save all edited")
+        self.btnSaveAll.setToolTip("Saves every edited picture into the save folder")
+        self.btnPdfAll = QPushButton("All pages as PDF")
+        self.btnPdfAll.setToolTip("One PDF with every open picture, one page each, in the order of the thumbnails")
+        self.btnApplyAll = QPushButton("Apply to all pictures")
+        self.btnApplyAll.setToolTip("Gives every picture the same clean / color settings as this one "
+                                    "(shadow removal included).")
+        self.btnCopy = QPushButton("Copy")
+        self.btnCopy.setToolTip("Copy this picture (with your edits) - then paste it anywhere (Ctrl+C)")
+        self.btnDrag = DragHandle(self)
+        for w in (self.btnSave, self.btnSaveAs, self.btnSaveAll, self.btnPdfAll):
+            r4.addWidget(w)
+        r4.addStretch(1)
+        for w in (self.btnApplyAll, self.btnCopy, self.btnDrag):
+            r4.addWidget(w)
+        root.addLayout(r4)
+
         self.group.idClicked.connect(lambda i: self._set_tool(self.keys[i]))
-        self.modeGroup.idClicked.connect(lambda i: setattr(self, "sel_mode", ("new", "add", "sub")[i]))
+        self.modeGroup.idClicked.connect(lambda i: setattr(self, "sel_mode", ("add", "sub")[i]))
         self.btnSelAll.clicked.connect(self.select_all)
         self.btnDeselect.clicked.connect(self.deselect)
         self.shapeGroup.idClicked.connect(self._set_shape)
@@ -954,6 +822,8 @@ class Card(QWidget):
         self.btnApplyAll.clicked.connect(lambda: self.applyAllRequested.emit(self))
         self.btnCopy.clicked.connect(self.copy_image)
         self.btnRemove.clicked.connect(lambda: self.removeRequested.emit(self))
+        self.btnRotL.clicked.connect(lambda: self.rotate(90.0))
+        self.btnRotR.clicked.connect(lambda: self.rotate(-90.0))
         self.btnZoomIn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
         self.btnZoomOut.clicked.connect(lambda: self.canvas.zoom_by(1 / 1.25))
         self.btnFit.clicked.connect(self.canvas.fit)
@@ -965,16 +835,14 @@ class Card(QWidget):
         self.panel.activated.connect(self._set_focus)
         self.btnSelVis.toggled.connect(self._toggle_sel_vis)
         self.panel.satChanged.connect(lambda v: self._set_global("sat", v))
-        self.texture.sharpChanged.connect(lambda v: self._set_global("sharp", v))
-        self.texture.detailChanged.connect(lambda v: self._set_global("detail", v))
+        self.panel.sharpChanged.connect(lambda v: self._set_global("sharp", v))
+        self.panel.detailChanged.connect(lambda v: self._set_global("detail", v))
         self.panel.featherChanged.connect(self._set_feather)
-        self.selPage.brushChanged.connect(lambda v: self._sync_quick())
-        self.imagePage.rotateRequested.connect(self.rotate)
         self.exportReady.connect(self._on_export_ready)
         self._tool_widgets = list(self.tools.values()) + [
             self.btnShadow, self.btnZoomIn, self.btnZoomOut, self.btnFit, self.btn100, self.btnSave, self.btnSaveAs,
             self.btnApplyAll, self.btnCopy, self.btnDrag, self.btnSelAll, self.btnDeselect, self.btnPdfAll,
-            self.imagePage.btnL, self.imagePage.btnR, self.imagePage.btn180, self.imagePage.btnFree] + self.modeBtns
+            self.btnRotL, self.btnRotR] + self.modeBtns
         self._enable_tools(False)
         self._update_buttons()
 
@@ -991,7 +859,7 @@ class Card(QWidget):
             self.lblState.setText("")
 
     def _toggle_sel_vis(self, on):
-        self.btnSelVis.setText("Selection: on" if on else "Selection: off")
+        self.btnSelVis.setText("Outline: on" if on else "Outline: off")
         self.canvas.set_selection_visible(on)
 
     # ------------------------------------------------------------ slow work
@@ -1053,20 +921,16 @@ class Card(QWidget):
         if not self._size_init:
             self._size_init = True
             size = max(8, min(200, int(round(max(w, h) / 60.0))))
-            for sl in (self.sizeSlider, self.selPage.rowBrush.sl):
-                sl.blockSignals(True)
-                sl.setValue(size)
-                sl.blockSignals(False)
-            self.selPage.rowBrush.val.setText("%d px" % size)
+            self.sizeSlider.blockSignals(True)
+            self.sizeSlider.setValue(size)
+            self.sizeSlider.blockSignals(False)
         self._sync_brush()
-        self._sync_quick()
         qimg = np_to_qimage(v["out"])
         if refit:
             self.canvas.set_images(qimg, self.prev)
         else:
             self.canvas.set_display(qimg, self.prev)
         self.canvas.set_selection(self.sel)
-        self.selPage.show_coverage(core.sel_coverage(self.sel))
         self._hl_key = None
         self._update_buttons()
 
@@ -1196,12 +1060,14 @@ class Card(QWidget):
         self._sel_ver += 1
         self.panel.rebuild(self.adjs)
         self.panel.set_globals(self.sat, self.feather)
-        self.texture.set_values(self.sharp, self.detail)
+        self.panel.set_clarity(self.sharp, self.detail)
 
     def _push_undo(self):
         self.undo.append(self._snap())
-        if len(self.undo) > 8:
-            self.undo.pop(0)
+        base = [i for i, e in enumerate(self.undo) if e.get("kind") != "sel"]
+        while len(base) > 8:
+            self.undo.pop(base.pop(0))
+            base = [i for i, e in enumerate(self.undo) if e.get("kind") != "sel"]
         self.ops += 1
 
     def _edit_base(self, label, make, keep_sel=True, refit=False, after=None, msg=None):
@@ -1257,7 +1123,7 @@ class Card(QWidget):
             self.feather = st["feather"]
             self.panel.rebuild(self.adjs)
             self.panel.set_globals(self.sat, self.feather)
-            self.texture.set_values(self.sharp, self.detail)
+            self.panel.set_clarity(self.sharp, self.detail)
         if not rebuild:                              # while loading: no preview yet, just take the values
             self._push_undo()
             after_state()
@@ -1379,50 +1245,60 @@ class Card(QWidget):
         self._touch()
 
     # ------------------------------------------------------------ selection
-    def _set_selection(self, mask, mode=None):
-        self.sel = core.sel_combine(self.sel, mask, mode or self.sel_mode)
+    def _push_sel_undo(self):
+        """Every selection change can be undone one step at a time (Ctrl+Z / Undo)."""
+        self.undo.append({"kind": "sel", "sel": self.sel})
+        base = [i for i, e in enumerate(self.undo) if e.get("kind") != "sel"]
+        while len(base) > 8:
+            self.undo.pop(base.pop(0))
+            base = [i for i, e in enumerate(self.undo) if e.get("kind") != "sel"]
+        if len(self.undo) > 40:
+            self.undo.pop(0)
+
+    def _sel_changed(self):
         self._sel_ver += 1
         self.canvas.set_selection(self.sel)
-        self.selPage.show_coverage(core.sel_coverage(self.sel))
         self._hl_key = None
         self._timer.start()                          # colour edits are limited to the selection
         if core.active_adjs(self.adjs):
             self._touch()
+        self._update_buttons()
+
+    def _set_selection(self, mask, mode=None):
+        new = core.sel_combine(self.sel, mask, mode or self.sel_mode)
+        if new is None and self.sel is None:
+            return
+        self._push_sel_undo()
+        self.sel = new
+        self._sel_changed()
 
     def select_all(self):
         if not self._loaded:
             return
+        self._push_sel_undo()
         self.sel = np.ones(self.prev.shape[:2], np.float32)
-        self._sel_ver += 1
-        self.canvas.set_selection(self.sel)
-        self.selPage.show_coverage(1.0)
-        self._hl_key = None
-        self._timer.start()
-        if core.active_adjs(self.adjs):
-            self._touch()
+        self._sel_changed()
 
     def deselect(self):
         if not self._loaded or self.sel is None:
             return
+        self._push_sel_undo()
         self.sel = None
-        self._sel_ver += 1
-        self.canvas.set_selection(None)
-        self.selPage.show_coverage(0)
-        self._hl_key = None
-        self._timer.start()
-        if core.active_adjs(self.adjs):
-            self._touch()
+        self._sel_changed()
 
     def _on_select(self, kind, data, mod):
         if not self._loaded:
             return
         mode = mod or self.sel_mode
         H, W = self.prev.shape[:2]
-        tol = float(self.selPage.rowTol.value())
+        size_prev = self.sizeSlider.value() * self.scale
         if kind in ("rect", "lasso"):
             self._set_selection(core.shape_mask((W, H), kind, data), mode)
             return
-        size_prev = self.selPage.rowBrush.value() * self.scale
+        if kind == "brush":
+            self._set_selection(core.shape_mask((W, H), "brush", data, size_prev), mode)
+            return
+        tol = float(self.tolSlider.value())
         prev = self.prev
 
         def work(progress):
@@ -1445,12 +1321,9 @@ class Card(QWidget):
                 self._set_selection(mask, mode)
         self._job("Selecting", work, done)
 
-    def _sync_quick(self):
-        self.canvas.set_quick_brush(self.selPage.rowBrush.value() * self.scale)
-
     def _on_move(self, dx, dy, copy_flag):
         if not self._loaded or self.sel is None:
-            self.message.emit("Make a selection first (Selection tab).")
+            self.message.emit("Make a selection first.")
             return
         s = self.scale
         sel, base = self.sel, self.base
@@ -1464,17 +1337,6 @@ class Card(QWidget):
         self._edit_base("Copying" if copy_flag else "Moving", make)
 
     # ---------------------------------------------------------------- tools
-    def _set_category(self, i):
-        self.catStack.setCurrentIndex(i)
-        self.side.setCurrentIndex(i)
-        if self._tool != "view" and self._tool not in CAT_TOOLS[i]:
-            self._go_move()
-        elif self._tool == "view" and CAT_TOOLS[i] and self._loaded:
-            first = CAT_TOOLS[i][0]
-            if i in (0, 1):                          # Color -> eyedropper, Selection -> quick select
-                self.tools[first].setChecked(True)
-                self._set_tool(first)
-
     def _set_tool(self, key):
         if not self._loaded:
             return
@@ -1485,10 +1347,13 @@ class Card(QWidget):
         crop = mode in (ImageCanvas.CROP, ImageCanvas.PERSP)
         self.btnApply.setVisible(crop)
         self.btnCancel.setVisible(crop)
-        self.eraseBar.setVisible(mode == ImageCanvas.ERASE)
-        if mode == ImageCanvas.ERASE:
+        erase = mode == ImageCanvas.ERASE
+        self.eraseBar.setVisible(erase or key in ("quick", "brush"))
+        self.shapeWidget.setVisible(erase)
+        self.tolWidget.setVisible(key == "quick")
+        if erase:
             self.canvas.set_erase(SHAPES[max(0, self.shapeGroup.checkedId())])
-            self._sync_brush()
+        self._sync_brush()
         self.lblHint.setText(HINTS[key])
 
     def _go_move(self):
@@ -1508,6 +1373,7 @@ class Card(QWidget):
         size = self.sizeSlider.value()
         self.lblSize.setText("%d px" % size)
         self.canvas.set_brush(size * self.scale)
+        self.canvas.set_quick_brush(size * self.scale)
 
     def _on_source(self, x, y):
         self.clone_src = (x, y)
@@ -1583,7 +1449,7 @@ class Card(QWidget):
         if not self._loaded:
             return
         base = self.base
-        strength = self.shadowPage.rowStrength.value() / 100.0
+        strength = self.panel.rowStrength.value() / 100.0
 
         def make(progress):
             return core.remove_shadow(base, strength, progress)
@@ -1597,6 +1463,10 @@ class Card(QWidget):
         if not self.undo:
             return
         st = self.undo.pop()
+        if st.get("kind") == "sel":                  # a selection step: instant
+            self.sel = st["sel"]
+            self._sel_changed()
+            return
 
         def work(progress):
             return self._build_view(st["base"], st["adjs"], st["sat"], st["sharp"], st["detail"], st.get("sel"))
@@ -1628,7 +1498,7 @@ class Card(QWidget):
         self._pending = None
         self.panel.rebuild(self.adjs)
         self.panel.set_globals(100, 0)
-        self.texture.set_values(0, 0)
+        self.panel.set_clarity(0, 0)
         self._clear_clone()
         self._go_move()
         self._rebuild_preview(refit=True)

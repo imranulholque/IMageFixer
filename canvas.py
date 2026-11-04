@@ -328,10 +328,10 @@ class ImageCanvas(QWidget):
             pts = [self.to_wid(q) for q in er["pts"]]
             kind = er["kind"]
             for width, col in ((3.0, QColor(0, 0, 0, 200)), (1.4, QColor(255, 255, 255, 255))):
-                pen = QPen(col, width, Qt.PenStyle.DashLine if kind != "quick" else Qt.PenStyle.SolidLine)
+                pen = QPen(col, width, Qt.PenStyle.DashLine if kind not in ("quick", "brush") else Qt.PenStyle.SolidLine)
                 p.setPen(pen)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                if kind == "quick":
+                if kind in ("quick", "brush"):
                     p.setPen(QPen(QColor(255, 255, 255, 110) if width > 2 else QColor(99, 102, 241, 170),
                                   max(1.0, self.quick_prev * z) if width > 2 else 1.4,
                                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -342,7 +342,7 @@ class ImageCanvas(QWidget):
                 else:
                     r = QRectF(pts[0], pts[-1]).normalized()
                     p.drawRect(r)
-        if self.select_shape == "quick" and self._hover is not None:
+        if self.select_shape in ("quick", "brush") and self._hover is not None:
             r = max(2.0, self.quick_prev * z / 2)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(20, 24, 34), 3))
@@ -689,8 +689,8 @@ class ImageCanvas(QWidget):
         if er is not None and self.mode == self.SELECT and e.button() == Qt.MouseButton.LeftButton:
             pts, kind = er["pts"], er["kind"]
             mod = getattr(self, "_sel_mod", "")
-            if kind == "quick":
-                self.selectFinished.emit("quick", [(q.x(), q.y()) for q in pts], mod)
+            if kind in ("quick", "brush"):
+                self.selectFinished.emit(kind, [(q.x(), q.y()) for q in pts], mod)
             elif kind == "lasso":
                 if len(pts) >= 3:
                     self.selectFinished.emit("lasso", [(q.x(), q.y()) for q in pts], mod)

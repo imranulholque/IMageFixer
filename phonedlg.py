@@ -5,7 +5,7 @@ import tempfile
 import segno
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout
 
 import phone
 
@@ -71,6 +71,20 @@ class PhoneDialog(QDialog):
         for w in (t, sub, self.qr, self.lblUrl, self.lblState):
             v.addWidget(w)
         v.addLayout(row)
+        prow = QHBoxLayout()
+        prow.addStretch(1)
+        prow.addWidget(QLabel("Port"))
+        self.spinPort = QSpinBox()
+        self.spinPort.setRange(1024, 65535)
+        self.spinPort.setValue(win.settings.value("phone_port", 8765, type=int) or 8765)
+        self.spinPort.setToolTip("The door number the phone connects to. Change it if another program uses it "
+                                 "or your firewall needs a fixed number. The IP address is found automatically.")
+        self.btnPort = QPushButton("Set port")
+        prow.addWidget(self.spinPort)
+        prow.addWidget(self.btnPort)
+        prow.addStretch(1)
+        v.addLayout(prow)
+        self.btnPort.clicked.connect(self._set_port)
         self.btnCopy.clicked.connect(self._copy)
         self.btnNew.clicked.connect(lambda: self._start(new_token=True))
         self.btnStop.clicked.connect(self._stop)
@@ -100,13 +114,25 @@ class PhoneDialog(QDialog):
             self.win.phone = srv
         srv = self.win.phone
         if not srv.running():
-            port = self.win.settings.value("phone_port", 0, type=int)
+            port = int(self.spinPort.value())
             if not srv.start(port):
                 self.lblState.setText("The connection could not be started (a firewall or another program may block it).")
                 return
             self.win.settings.setValue("phone_port", srv.port)
         self._url = None
         self._tick()
+
+    def _set_port(self):
+        """Use the port typed in the box (new QR code, same secret link otherwise)."""
+        self.win.settings.setValue("phone_port", int(self.spinPort.value()))
+        if self.win.phone is not None:
+            self.win.phone.stop()
+            self.win.phone = None
+        self._start()
+        srv = self.win.phone
+        if srv is not None and srv.running() and srv.port != self.spinPort.value():
+            self.lblState.setText("Port %d is busy - using %d instead." % (self.spinPort.value(), srv.port))
+            self.spinPort.setValue(srv.port)
 
     def _stop(self):
         if self.win.phone is not None:

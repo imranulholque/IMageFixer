@@ -1,15 +1,14 @@
 IMAGE FIXER  (Windows)
 ======================
-Edit many text pictures (WhatsApp photos, scans) side by side. Tabs above the picture:
- - Color:     Eyedropper. Click a color / black shade -> its own slider (100% = original, 0% = fades into the
-              paper, 200% = stronger / darker). Saturation for the whole picture.
- - Selection: Quick select (brush over an object), Rectangle, Freehand, Color range. New / Add / Subtract,
-              Select all, Deselect. Color changes act only inside the selection. "Move selected" and
-              "Copy selected" drag the selected part to another place. Shift+drag = add, Alt+drag = subtract.
-              Ctrl+A = select all, Ctrl+D = deselect. "Selection: on/off" (top bar) hides the moving outline.
- - Texture:   text & line sharpness, faint strokes.
- - Shadow:    one-click shadow removal that keeps the edges of text, stamps and shapes.
- - Image:     rotate 90 / 180 / any angle, Crop, Perspective crop (4 points), Eraser / clone.
+Clean many text pictures (WhatsApp photos, scans) and print them. One big card per picture - slide to the next.
+ - Clean:       one click turns shadows and grey paper white (like a scanner); text, handwriting and lines stay.
+                Strength / Text sharpness / Faint strokes sliders on the right.
+ - Eyedropper:  click a color -> one slider: fade it into the paper, or make it stronger / darker.
+ - Select:      Quick select (brush over an object), Brush, Box, Freehand. "Add" / "Subtract" decide what the next
+                shape does; Ctrl+Z undoes selection steps one by one. "All" / "None". Color changes act only inside
+                the selection. "Move" / "Copy" take the selected part to another place.
+ - Erase:       paint over something (a stamp, a filled-in part of a form) and it is filled from the paper around it.
+ - Crop / Straighten (4 corners, for photographed pages) / Rotate left & right.
 Slow work shows a progress bar at the bottom; the window stays usable.
 
 SAVING

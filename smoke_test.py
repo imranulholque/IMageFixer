@@ -87,6 +87,15 @@ def main():
     def wait():
         assert win.runner.wait_idle(60), "a background job did not finish"
 
+    def undo_to(card_, n):
+        """undo until n edits remain (selection steps count as undo steps too)"""
+        guard = 0
+        while card_.ops > n and guard < 60:
+            card_.undo_step()
+            wait()
+            guard += 1
+        assert card_.ops == n, (card_.ops, n)
+
     def pick():
         card.tools["pick"].click()
         ys, xs = np.where(card.prev.astype(int).sum(2) < 90)
@@ -171,25 +180,20 @@ def main():
 
     def rotate():
         n = card.ops
-        card.imagePage.btnL.click()
+        card.btnRotL.click()
         wait()
         assert card.base.size == (600, 900), card.base.size
-        card.imagePage.btn180.click()
+        card.btnRotR.click()
         wait()
-        card.imagePage.spin.setValue(10.0)
-        card.imagePage.btnFree.click()
-        wait()
-        assert card.base.size[0] > 600 and card.ops == n + 3
-        for _ in range(3):
-            card.undo_step()
-            wait()
-        assert card.base.size == (900, 600) and card.ops == n
-    step("rotate 90 / 180 / free angle + undo", rotate)
+        assert card.base.size == (900, 600) and card.ops == n + 2
+        undo_to(card, n)
+        assert card.base.size == (900, 600)
+    step("rotate left / right + undo", rotate)
 
     def globals_():
         card.panel.rowSat.sl.setValue(140)
-        card.texture.rowSharp.sl.setValue(50)
-        card.texture.rowDetail.sl.setValue(30)
+        card.panel.rowSharp.sl.setValue(50)
+        card.panel.rowDetail.sl.setValue(30)
         card.panel.rowFeather.sl.setValue(20)
         card.render_sync()
         assert (card.sat, card.sharp, card.detail, card.feather) == (140, 50, 30, 20)
@@ -209,7 +213,6 @@ def main():
     step("outline of the picked color, selection on/off", selection_ants)
 
     def selection_tools():
-        H, W = card.prev.shape[:2]
         card.tools["rect"].click()
         c = card.canvas
         QTest.mousePress(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(200, 150))
@@ -219,34 +222,40 @@ def main():
         QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(400, 300))
         assert card.sel is not None
         cov1 = core.sel_coverage(card.sel)
-        card.modeBtns[1].click()                                   # Add
-        card._on_select("rect", (0.0, 0.0, 60.0, 60.0), "")
+        card._on_select("rect", (0.0, 0.0, 60.0, 60.0), "")          # default mode = Add
         cov2 = core.sel_coverage(card.sel)
         assert cov2 > cov1, (cov1, cov2)
-        card.modeBtns[2].click()                                   # Subtract
+        card.modeBtns[1].click()                                   # Subtract
         card._on_select("rect", (0.0, 0.0, 60.0, 60.0), "")
         assert abs(core.sel_coverage(card.sel) - cov1) < 0.01
+        card.undo_step()                                           # undo the subtract
+        assert abs(core.sel_coverage(card.sel) - cov2) < 0.01
+        card.modeBtns[0].click()
+        card.tools["brush"].click()
+        card._on_select("brush", [(100.0, 100.0), (150.0, 120.0)], "")
+        cov3 = core.sel_coverage(card.sel)
+        assert cov3 > cov2
+        card.modeBtns[1].click()
+        card._on_select("brush", [(100.0, 100.0), (150.0, 120.0)], "")   # paint it away again
+        assert core.sel_coverage(card.sel) < cov3
         card.modeBtns[0].click()
         card.tools["lasso"].click()
         card._on_select("lasso", [(50.0, 300.0), (200.0, 290.0), (210.0, 380.0), (60.0, 390.0)], "")
-        assert card.sel is not None and core.sel_coverage(card.sel) > 0
         card.select_all()
         assert core.sel_coverage(card.sel) > 0.99
         card.deselect()
         assert card.sel is None
-        card.tools["color"].click()
-        ys, xs = np.where(card.prev.astype(int).sum(2) < 90)
-        card._on_select("color", (int(xs[0]), int(ys[0])), "")
-        wait()
-        assert card.sel is not None and core.sel_coverage(card.sel) > 0
+        card.undo_step()                                           # deselect undone -> all selected again
+        assert core.sel_coverage(card.sel) > 0.99
         card.deselect()
+        ys, xs = np.where(card.prev.astype(int).sum(2) < 90)
         card.tools["quick"].click()
         card._on_select("quick", [(float(xs[0]), float(ys[0])), (float(xs[0]) + 4, float(ys[0]))], "")
         wait()
         assert card.sel is not None
         assert not card.canvas.grab().isNull()
         card.deselect()
-    step("selection: rectangle, add, subtract, freehand, all, none, color range, quick select", selection_tools)
+    step("selection: box, add, subtract, brush, freehand, all, none, undo, quick select", selection_tools)
 
     def selection_limits_color():
         arr = card.prev
@@ -282,10 +291,7 @@ def main():
         assert not card.canvas.grab().isNull()
         QTest.mouseRelease(card.canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(320, 270))
         wait()
-        for _ in range(card.ops - n):
-            card.undo_step()
-            wait()
-        assert card.ops == n
+        undo_to(card, n)
         card.deselect()
         card._go_move()
     step("move / copy the selected part + undo", move_copy)
@@ -321,19 +327,9 @@ def main():
         QTest.mouseRelease(c, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(260, 250))
         wait()
         assert card.ops == n + 7, (card.ops, n)
-        for _ in range(7):
-            card.undo_step()
-            wait()
-        assert card.ops == n
+        undo_to(card, n)
         card._go_move()
     step("eraser: brush, shapes, clone, mouse", eraser)
-
-    def tabs():
-        for i in range(5):
-            card.catBtns[i].click()
-            assert card.side.currentIndex() == i and card.catStack.currentIndex() == i
-        card.catBtns[0].click()
-    step("category tabs", tabs)
 
     def copy_out():
         card.copy_image()
