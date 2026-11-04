@@ -391,11 +391,11 @@ class MainWindow(QMainWindow):
         self.strip.currentRowChanged.connect(self._strip_changed)
         self.btnPageL = QPushButton("\u21e0")
         self.btnPageR = QPushButton("\u21e2")
-        for b, d, tip in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)"),
-                          (self.btnPageR, 1, "Move this page later (page order in the PDF)")):
-            b.setToolTip(tip)
-            b.setProperty("flat", True)
-            b.clicked.connect(lambda _=False, d=d: self.move_page(d))
+        for pb, d, tip in ((self.btnPageL, -1, "Move this page earlier (page order in the PDF)"),
+                           (self.btnPageR, 1, "Move this page later (page order in the PDF)")):
+            pb.setToolTip(tip)
+            pb.setProperty("flat", True)
+            pb.clicked.connect(lambda _=False, d=d: self.move_page(d))
         self.progress = QProgressBar()
         self.progress.setFixedWidth(170)
         self.progress.setTextVisible(False)
