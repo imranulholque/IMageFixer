@@ -61,13 +61,35 @@ class Strip(QListWidget):
         super().__init__()
         self.provider = None
         self.preparer = None
+        self._press = None
+        self._press_item = None
         self.setMouseTracking(True)
         self.itemEntered.connect(lambda it: self.preparer(it.data(Qt.ItemDataRole.UserRole)) if self.preparer else None)
 
-    def startDrag(self, supportedActions):
+    def mousePressEvent(self, e):
+        self._press = e.position().toPoint() if e.button() == Qt.MouseButton.LeftButton else None
+        self._press_item = self.itemAt(e.position().toPoint())
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        """Our own drag start (Qt's list drag does not start in this layout): press a thumbnail, move a little."""
+        if (self._press is not None and self._press_item is not None and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.position().toPoint() - self._press).manhattanLength() >= QApplication.startDragDistance()):
+            it = self._press_item
+            self._press = None
+            self._press_item = None
+            self._drag_item(it)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press = None
+        self._press_item = None
+        super().mouseReleaseEvent(e)
+
+    def _drag_item(self, it):
         """Always COPY: a move would take the user's original file away."""
-        it = self.currentItem()
-        if it is None or self.provider is None:
+        if self.provider is None:
             return
         try:
             md = self.provider(it.data(Qt.ItemDataRole.UserRole))
@@ -81,6 +103,9 @@ class Strip(QListWidget):
         if not ic.isNull():
             d.setPixmap(ic.pixmap(96, 96))
         d.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+
+    def startDrag(self, supportedActions):
+        pass
 
     def mimeData(self, items):
         if self.provider is not None and items:
@@ -229,11 +254,12 @@ class MainWindow(QMainWindow):
         self.runner = JobRunner(self)
         self.runner.changed.connect(self._job_changed)
         self.phone = None
+        self.phone_tunnel = None
         self._phone_dlg = None
         self.setWindowTitle("Image Fixer")
         self.setWindowIcon(make_icon())
         self.setAcceptDrops(True)
-        self.setMinimumSize(1100, 680)
+        self.setMinimumSize(940, 600)
 
         central = QWidget()
         central.setObjectName("root")
@@ -373,8 +399,8 @@ class MainWindow(QMainWindow):
         self.strip = Strip()
         self.strip.provider = self._mime_for
         self.strip.preparer = self._prepare_for
-        self.strip.setDragEnabled(True)
-        self.strip.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.strip.setDragEnabled(False)
+        self.strip.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.strip.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.strip.setObjectName("strip")
         self.strip.setViewMode(QListView.ViewMode.IconMode)
@@ -450,20 +476,59 @@ class MainWindow(QMainWindow):
         def sc(keys, fn):
             s = QShortcut(QKeySequence(keys), self)
             s.activated.connect(fn)
-        sc("Left", lambda: self.carousel.prev())
-        sc("Right", lambda: self.carousel.next())
+
+        def cur(fn):
+            return lambda: self._with_current(fn)
+        def arrow(dx, dy):
+            c = self.carousel.current()
+            if c is not None and c._tool == "transform":
+                c.tf_nudge(dx, dy)
+            elif dx < 0:
+                self.carousel.prev()
+            elif dx > 0:
+                self.carousel.next()
+        sc("Left", lambda: arrow(-1, 0))
+        sc("Right", lambda: arrow(1, 0))
+        sc("Up", lambda: arrow(0, -1))
+        sc("Down", lambda: arrow(0, 1))
+        sc("Shift+Left", lambda: arrow(-10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Right", lambda: arrow(10, 0) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Up", lambda: arrow(0, -10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        sc("Shift+Down", lambda: arrow(0, 10) if (self.carousel.current() is not None and self.carousel.current()._tool == "transform") else None)
+        for keys, deg in (("[", -1), ("]", 1), ("Ctrl+[", -15), ("Ctrl+]", 15),
+                          ("Ctrl+Alt+Left", -90), ("Ctrl+Alt+Right", 90)):
+            sc(keys, lambda d=deg: self._with_current(lambda c: c.tf_rotate(d)))
+        sc("R", lambda: self._with_current(lambda c: c.rotate_key(-90.0)))      # 90° right: the selected picture, else the page
+        sc("Shift+R", lambda: self._with_current(lambda c: c.rotate_key(90.0)))   # 90° left
         sc("Ctrl+V", self.paste)
-        sc("Ctrl+C", lambda: self._with_current(lambda c: c.copy_image()))
+        sc("Ctrl+C", cur(lambda c: c.copy_image()))
         sc("Ctrl+O", self.choose_files)
-        sc("Ctrl+S", lambda: self._with_current(self.save_card))
+        sc("Ctrl+S", cur(self.save_card))
         sc("Ctrl+Shift+S", self.save_all)
-        sc("Ctrl+Z", lambda: self._with_current(lambda c: c.undo_step()))
-        sc("Ctrl+A", lambda: self._with_current(lambda c: c.select_all()))
-        sc("Ctrl+D", lambda: self._with_current(lambda c: c.deselect()))
-        sc("Ctrl+0", lambda: self._with_current(lambda c: c.canvas.fit()))
-        sc("Ctrl+=", lambda: self._with_current(lambda c: c.canvas.zoom_by(1.25)))
-        sc("Ctrl++", lambda: self._with_current(lambda c: c.canvas.zoom_by(1.25)))
-        sc("Ctrl+-", lambda: self._with_current(lambda c: c.canvas.zoom_by(0.8)))
+        # history
+        sc("Ctrl+Z", cur(lambda c: c.undo_step()))
+        sc("Ctrl+Y", cur(lambda c: c.redo_step()))
+        sc("Ctrl+Shift+Z", cur(lambda c: c.redo_step()))
+        # selection / editing
+        sc("Ctrl+A", cur(lambda c: c.select_all()))
+        sc("Ctrl+D", cur(lambda c: c.deselect()))
+        sc("Ctrl+Shift+I", cur(lambda c: c.invert_selection()))
+        sc("Ctrl+T", cur(lambda c: c.start_transform()))
+        sc("Delete", cur(lambda c: c.delete_selection()))
+        sc("Backspace", cur(lambda c: c.delete_selection()))
+        sc("Return", cur(lambda c: c.apply_pending()))
+        sc("Enter", cur(lambda c: c.apply_pending()))
+        sc("Escape", cur(lambda c: c.cancel_pending()))
+        # tools (single letters, like in a picture editor)
+        for key, tool in (("V", "move"), ("M", "rect"), ("L", "lasso"), ("W", "color"), ("B", "brush"),
+                          ("E", "erase_brush"), ("C", "crop"), ("I", "pick"), ("H", "view")):
+            sc(key, cur(lambda c, t=tool: c.choose_tool(t)))
+        # zoom
+        sc("Ctrl+0", cur(lambda c: c.canvas.fit()))
+        sc("Ctrl+1", cur(lambda c: c.canvas.zoom_to(1.0 / max(c.scale, 1e-6))))
+        sc("Ctrl+=", cur(lambda c: c.canvas.zoom_by(1.25)))
+        sc("Ctrl++", cur(lambda c: c.canvas.zoom_by(1.25)))
+        sc("Ctrl+-", cur(lambda c: c.canvas.zoom_by(0.8)))
 
     def _with_current(self, fn):
         c = self.carousel.current()
@@ -480,7 +545,10 @@ class MainWindow(QMainWindow):
             else:
                 self.progress.setRange(0, 1000)
                 self.progress.setValue(int(frac * 1000))
+            self._job_text = text
             self.lblStatus.setText(text)
+        elif self.lblStatus.text() == getattr(self, "_job_text", None):
+            self.lblStatus.setText("")                  # the work is finished: remove "Selecting" etc.
 
     def _busy(self):
         if self.runner.busy:
@@ -520,6 +588,8 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
         self.quitting = True
+        if self.phone_tunnel is not None:
+            self.phone_tunnel.stop()
         if self.phone is not None:
             self.phone.stop()
         self.settings.setValue("geometry", self.saveGeometry())
@@ -533,11 +603,35 @@ class MainWindow(QMainWindow):
         if md.hasUrls() or md.hasImage():
             e.acceptProposedAction()
 
+    def _overlay_card(self):
+        """The picture being edited, when its Picture tab is open: new pictures then become layers on it."""
+        if self.stack.currentIndex() != 1 or not self.carousel.cards:
+            return None
+        try:
+            c = self.carousel.cards[self.carousel.index]
+        except IndexError:
+            return None
+        return c if c.picture_tab_open() else None
+
+    def add_incoming(self, paths):
+        """Pasted / dropped / phone pictures: a layer on the open Picture tab, otherwise new main pictures."""
+        c = self._overlay_card()
+        if c is None:
+            self.add_files(paths)
+            return
+        files = [p for p in self._expand(paths)]
+        if not files:
+            self.say("No pictures found.")
+            return
+        for p in files:
+            c.add_picture(p)
+        self.say("Added %d picture(s) on top of this page." % len(files))
+
     def dropEvent(self, e):
         md = e.mimeData()
         paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
         if paths:
-            self.add_files(paths)
+            self.add_incoming(paths)
         elif md.hasImage():
             self._add_qimage(md.imageData())
         e.acceptProposedAction()
@@ -550,7 +644,7 @@ class MainWindow(QMainWindow):
         if md.hasUrls():
             paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
             if paths:
-                self.add_files(paths)
+                self.add_incoming(paths)
                 return
         if md.hasImage():
             self._add_qimage(cb.image())
@@ -563,7 +657,7 @@ class MainWindow(QMainWindow):
         self._paste_n += 1
         p = os.path.join(self.tmp, "pasted_%s_%d.png" % (time.strftime("%H%M%S"), self._paste_n))
         if img.save(p, "PNG"):
-            self.add_files([p])
+            self.add_incoming([p])
 
     def choose_files(self):
         start = self.settings.value("last_dir", "", type=str)
@@ -688,12 +782,15 @@ class MainWindow(QMainWindow):
         if not others:
             self.say("There is no other picture yet.")
             return
-        st = card.settings()
+        act = card.last_action
+        if act is None:
+            self.say("Change a setting first (a slider, shadow removal ...). Then this button copies that one setting.")
+            return
         for c in others:
-            c.apply_settings(st)
+            c.apply_action(act)
         self._refresh_counts()
-        self.say("Same colors / saturation / clarity given to %d other picture(s). "
-                 "From now on a change stays on the picture you change." % len(others))
+        self.say("Last setting (%s) applied to %d other picture(s). Crop, erase and other edits were not touched."
+                 % (act["label"], len(others)))
 
     def _card(self, uid):
         for c in self.carousel.cards:
@@ -935,7 +1032,7 @@ class MainWindow(QMainWindow):
 
     def phone_received(self, paths):
         self.show_front()
-        self.add_files(paths)
+        self.add_incoming(paths)
         self.say("Received %d picture(s) from the phone." % len(paths))
 
     # ------------------------------------------------------------- settings
